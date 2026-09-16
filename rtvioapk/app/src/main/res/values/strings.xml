@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RTVIO Mapper</string>
+
+    <!-- Screens -->
+    <string name="title_settings">Settings</string>
+    <string name="title_specs">Device specifications</string>
+
+    <!-- Main controls -->
+    <string name="action_start">START STREAMING</string>
+    <string name="action_stop">STOP STREAMING</string>
+    <string name="action_connect">CONNECT</string>
+    <string name="action_cancel_connect">CANCEL</string>
+    <string name="action_disconnect">DISCONNECT</string>
+    <string name="action_record">● REC</string>
+    <string name="action_stop_record">■ STOP</string>
+    <string name="action_uploading">UPLOADING %1$d</string>
+    <string name="state_armed">READY</string>
+    <string name="state_recording">RECORDING</string>
+    <string name="state_finishing">UPLOADING</string>
+    <string name="mode_remote_armed">Remote (RTVIO Studio): ready</string>
+    <string name="mode_remote_recording">Remote: recording %1$s</string>
+    <string name="mode_remote_finishing">Remote: uploading %1$d queued frames</string>
+    <string name="mode_live">Live stream (legacy receiver)</string>
+    <string name="disconnect_unsent_title">Frames not uploaded yet</string>
+    <string name="disconnect_unsent_message">%1$d recorded frames are still waiting to be sent. Disconnecting now discards them.</string>
+    <string name="disconnect_anyway">Disconnect anyway</string>
+    <string name="action_settings">SETTINGS</string>
+    <string name="menu_specs">Device specs</string>
+    <string name="menu_settings">Settings</string>
+    <string name="menu_share">Share specs</string>
+    <string name="menu_recordings">Saved sessions</string>
+
+    <!-- Local (offline) recording -->
+    <string name="action_record_local">RECORD LOCALLY</string>
+    <string name="action_stop_record_local">■ STOP RECORDING</string>
+    <string name="mode_local_recording">Recording locally: %1$s</string>
+    <string name="no_receiver_hint">No receiver found at %1$s — recording locally only</string>
+    <string name="local_summary_title">Saved to phone storage</string>
+    <string name="local_summary_hint">Saved as \"%1$s\". Open Saved sessions to transfer it once you\'re back near the desktop.</string>
+    <string name="title_recordings">Saved sessions</string>
+    <string name="recordings_empty">No local recordings yet. Use RECORD LOCALLY on the main screen.</string>
+    <string name="recordings_no_receiver">No receiver found at %1$s:%2$d. Connect to the same WiFi as the desktop, set Server IP in Settings, then try again.</string>
+    <string name="recordings_transfer">Transfer</string>
+    <string name="recordings_delete">Delete</string>
+    <string name="recordings_delete_title">Delete this session?</string>
+    <string name="recordings_delete_message">This permanently deletes %1$d frames from phone storage. This cannot be undone.</string>
+    <string name="recordings_transferring">Sending %1$s…</string>
+    <string name="recordings_transfer_done">Sent \"%1$s\" to %2$s</string>
+    <string name="recordings_transfer_failed">Transfer failed: %1$s</string>
+    <string name="recordings_delete_after_transfer_title">Delete from phone?</string>
+    <string name="recordings_delete_after_transfer_message">\"%1$s\" was sent successfully. Delete the copy on this phone to free up space?</string>
+    <string name="keep">Keep</string>
+
+    <!-- Status panel -->
+    <string name="status_panel_title">Status</string>
+    <string name="label_server">Server</string>
+    <string name="label_fps">FPS</string>
+    <string name="label_latency">Send latency</string>
+    <string name="label_bandwidth">Bandwidth</string>
+    <string name="label_mode">Mode</string>
+    <string name="label_frames">Frames sent</string>
+    <string name="label_imu">IMU samples</string>
+    <string name="label_battery">Battery</string>
+    <string name="label_buffer">Buffer</string>
+
+    <string name="state_connected">CONNECTED</string>
+    <string name="state_connecting">CONNECTING…</string>
+    <string name="state_disconnected">DISCONNECTED</string>
+    <string name="state_error">ERROR</string>
+
+    <string name="mode_outdoor">Outdoor</string>
+    <string name="mode_indoor">Indoor</string>
+
+    <string name="overlay_wifi_lost">WiFi disconnected — streaming paused</string>
+    <string name="no_server_set">No server configured</string>
+
+    <!-- Permissions -->
+    <string name="perm_location_rationale">Outdoor mode streams GPS fixes so the desktop can georeference the model. Location access is also what lets Android report the WiFi SSID.</string>
+    <string name="perm_grant">Grant</string>
+    <string name="perm_denied_camera">Camera permission denied — streaming is unavailable.</string>
+    <string name="perm_open_settings">Open app settings</string>
+
+    <!-- Session summary -->
+    <string name="summary_title">Session summary</string>
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+
+    <!-- Notification -->
+    <string name="notif_channel">Streaming</string>
+    <string name="notif_channel_desc">Shown while RTVIO Mapper is capturing and streaming.</string>
+    <string name="notif_title">RTVIO Mapper is streaming</string>
+    <string name="notif_starting">Starting capture…</string>
+    <string name="action_stop_notification">Stop</string>
+
+    <!-- Settings: categories -->
+    <string name="cat_connection">Connection</string>
+    <string name="cat_video">Video</string>
+    <string name="cat_sensors">Sensors</string>
+    <string name="cat_reliability">Reliability</string>
+    <string name="cat_display">Display</string>
+
+    <!-- Settings: connection -->
+    <string name="pref_server_ip">Server IP address</string>
+    <string name="pref_server_ip_summary">IP of the desktop receiver on this network</string>
+    <string name="pref_server_port">Server port</string>
+    <string name="pref_discover">Find receivers on this network</string>
+    <string name="pref_discover_summary">Browses for _rtvio._tcp services via mDNS</string>
+    <string name="pref_test">Test connection</string>
+    <string name="pref_test_summary">Connects, reads the handshake, disconnects</string>
+    <string name="discovering">Searching for receivers…</string>
+    <string name="discovery_none">No receivers found. Many networks block multicast — enter the IP manually.</string>
+    <string name="discovery_title">Select a receiver</string>
+    <string name="testing">Testing…</string>
+
+    <!-- Settings: video -->
+    <string name="pref_resolution">Video resolution</string>
+    <string name="pref_aspect">Aspect ratio</string>
+    <string name="pref_fps">Video frame rate</string>
+    <string name="pref_quality">JPEG quality</string>
+
+    <!-- Settings: sensors -->
+    <string name="pref_imu_rate">IMU sample rate</string>
+    <string name="pref_imu_batch">IMU batch interval</string>
+    <string name="pref_mode">Outdoor mode</string>
+    <string name="pref_mode_on">GPS fixes are streamed for georeferencing</string>
+    <string name="pref_mode_off">Indoor — GPS off, IMU and video only</string>
+
+    <!-- Settings: reliability -->
+    <string name="pref_auto_reconnect">Auto-reconnect</string>
+    <string name="pref_auto_reconnect_summary">Retry with exponential backoff if the link drops</string>
+    <string name="pref_reconnect_interval">Reconnect interval</string>
+    <string name="pref_keep_awake">Keep device awake</string>
+    <string name="pref_keep_awake_summary">Holds a wake lock so capture survives the screen turning off</string>
+
+    <!-- Settings: display -->
+    <string name="pref_fps_overlay">Show FPS overlay</string>
+    <string name="pref_show_stats">Show statistics</string>
+    <string name="pref_show_stats_summary">Bandwidth, latency and buffer usage in the status panel</string>
+    <string name="pref_haptics">Haptic feedback</string>
+    <string name="pref_haptics_summary">Vibrate on connect and disconnect</string>
+
+    <string name="pref_bandwidth_title">Estimated uplink required</string>
+    <string name="bandwidth_estimate">Estimated uplink: %1$s Mbps</string>
+
+    <!-- Specs screen -->
+    <string name="cd_preview">Camera preview</string>
+</resources>
