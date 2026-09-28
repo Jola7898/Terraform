@@ -200,6 +200,12 @@
         <h2>Sessions</h2>
         <label class="check small" title="Drone takes are always reconstructed as soon as they stop"><input type="checkbox" data-setting="auto_reconstruct"> reconstruct phone takes automatically</label>
       </div>
+      <div class="form" style="margin-bottom:10px">
+        <label class="btn" style="cursor:pointer;display:inline-block">Import session (.zip)
+          <input type="file" id="importSessionFile" accept=".zip" style="display:none">
+        </label>
+        <span id="importStatus" class="muted small"></span>
+      </div>
       <div id="sessions" class="sessions"><div class="muted">No recordings yet.</div></div>
     </div>
 

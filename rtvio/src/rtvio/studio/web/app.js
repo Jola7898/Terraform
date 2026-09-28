@@ -463,6 +463,7 @@ function renderSessionCard(s) {
     if (outs["cloud_raw.ply"]) actions.push(`<a class="btn" href="${base}cloud_raw.ply" download="${s.id}_cloud_raw.ply">cloud_raw.ply</a>`);
     if (outs["mesh_poisson.ply"]) actions.push(`<a class="btn" href="${base}mesh_poisson.ply" download="${s.id}_mesh_poisson.ply">mesh_poisson.ply</a>`);
     if (outs["CHECKPOINT_REPORT.md"]) actions.push(`<a class="btn" href="${base}CHECKPOINT_REPORT.md" target="_blank">report</a>`);
+    if (m && !s.recording) actions.push(`<a class="btn" href="/api/sessions/${encodeURIComponent(s.id)}/export" download="${s.id}.zip">Export .zip</a>`);
     if (running && job.state !== "cancelling") actions.push(`<button data-cancel="${job.id}">Cancel</button>`);
     else if (m && !s.recording) actions.push(`<button data-recon="${s.id}">${rec ? "Reconstruct again" : "Reconstruct"}</button>`);
     if (job && job.state !== "queued") actions.push(`<button data-log="${job.id}">log</button>`);
@@ -545,6 +546,27 @@ async function onJobsClick(ev) {
 }
 $("sessions").addEventListener("click", onJobsClick);
 $("videoJobs").addEventListener("click", onJobsClick);
+
+$("importSessionFile").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const status = $("importStatus");
+  status.textContent = `uploading ${file.name}…`;
+  try {
+    // Raw file bytes as the body - no multipart needed for a single file,
+    // and the server streams this straight to disk rather than parsing it.
+    const res = await fetch("/api/sessions/import", { method: "POST", body: file });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+    status.textContent = `imported as ${data.session}`;
+    pollSessions();
+  } catch (e) {
+    status.textContent = "";
+    alert("Import failed: " + e.message);
+  } finally {
+    ev.target.value = "";
+  }
+});
 
 $("videoReconBtn").addEventListener("click", async () => {
   // "Copy as path" in Explorer quotes the path; drop the quotes.

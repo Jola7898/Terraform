@@ -1,0 +1,24 @@
+{
+  "model": "pinhole",
+  "width": 1280,
+  "height": 720,
+  "fx": 503.2563063192166,
+  "fy": 502.1993621682545,
+  "cx": 663.4358522027329,
+  "cy": 357.96867544533603,
+  "k1": -0.3042024860090645,
+  "k2": 0.08887071706379039,
+  "p1": 0.0016469074602369186,
+  "p2": -0.0012284539872971978,
+  "k3": -0.011585042350439978,
+  "rms_px": 0.9742,
+  "views": 25,
+  "views_dropped": 0,
+  "alternatives": {
+    "fisheye": "failed",
+    "pinhole": 0.9742
+  },
+  "calibrated": "2026-09-28 14:47",
+  "source": "checkerboard 9x6, 25 views (RTVIO Studio)",
+  "views_dir": "C:\\Users\\HP\\Desktop\\RTVIO\\rtvio\\data\\drone_calib\\20260928-144644"
+}

@@ -21,10 +21,12 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 import threading
 import time
 import urllib.parse
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .drone_link import DroneLink
@@ -204,6 +206,44 @@ class Studio:
             return None
         d = os.path.join(self.sessions_root, sid)
         return d if os.path.isdir(d) else None
+
+    def unique_session_id(self, preferred):
+        """A free directory name under sessions_root: `preferred` if it is a
+        valid id and not already taken (so an imported session can keep the
+        id it was exported with), otherwise a timestamp-based one like
+        phone_link.new_session_id / drone_link.new_drone_session_id."""
+        if preferred and SESSION_ID_RE.match(preferred) and not os.path.exists(
+                os.path.join(self.sessions_root, preferred)):
+            return preferred
+        base = time.strftime("%Y%m%d-%H%M%S") + "-imported"
+        sid, n = base, 1
+        while os.path.exists(os.path.join(self.sessions_root, sid)):
+            n += 1
+            sid = "%s-%d" % (base, n)
+        return sid
+
+    def import_session_zip(self, zip_path, preferred_id=None):
+        """Extracts a .zip built by export_session_zip (files at the zip
+        root, not nested in a folder) into a new session directory. Returns
+        (True, session_id) or (False, error)."""
+        sid = self.unique_session_id(preferred_id)
+        dest = os.path.join(self.sessions_root, sid)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                dest_real = os.path.realpath(dest)
+                for member in zf.namelist():
+                    target = os.path.realpath(os.path.join(dest, member))
+                    if target != dest_real and not target.startswith(dest_real + os.sep):
+                        return False, "zip entry escapes the session directory: %s" % member
+                os.makedirs(dest, exist_ok=True)
+                zf.extractall(dest)
+        except zipfile.BadZipFile:
+            shutil.rmtree(dest, ignore_errors=True)
+            return False, "not a valid zip file"
+        if not os.path.exists(os.path.join(dest, "session_meta.json")):
+            shutil.rmtree(dest, ignore_errors=True)
+            return False, "zip has no session_meta.json at its root - not a session export"
+        return True, sid
 
     def video_job_dir(self, dirname):
         if not SESSION_ID_RE.match(dirname or ""):
@@ -391,6 +431,73 @@ def make_handler(studio):
                         break
                     self.wfile.write(chunk)
 
+        def _export_session(self, sid):
+            """Zips a session directory (files at the zip root, so
+            import_session_zip's extractall lands them straight back into a
+            fresh session dir with no extra nesting to strip) and streams it
+            down as a download. Built into a temp file first rather than
+            written straight to self.wfile - zipfile wants a seekable
+            stream to place its central directory, which a socket isn't."""
+            d = studio.session_dir(sid)
+            if d is None:
+                return self._send(404, {"error": "no such session"})
+            if not os.path.exists(os.path.join(d, "session_meta.json")):
+                return self._send(409, {"error": "session is still recording"})
+            fd, tmp_path = tempfile.mkstemp(suffix=".zip", dir=studio.data_root)
+            os.close(fd)
+            try:
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for root, _dirs, files in os.walk(d):
+                        for fn in files:
+                            fp = os.path.join(root, fn)
+                            zf.write(fp, arcname=os.path.relpath(fp, d))
+                size = os.path.getsize(tmp_path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", 'attachment; filename="%s.zip"' % sid)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                with open(tmp_path, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+        def _import_session(self, preferred_id):
+            """Body is the raw bytes of a .zip (no multipart - the browser
+            just fetch()es the File object directly as the request body),
+            streamed straight to a temp file so a large take never has to
+            sit fully in memory."""
+            n = int(self.headers.get("Content-Length") or 0)
+            if not n:
+                return self._send(400, {"ok": False, "error": "empty upload"})
+            fd, tmp_path = tempfile.mkstemp(suffix=".zip", dir=studio.data_root)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    remaining = n
+                    while remaining:
+                        chunk = self.rfile.read(min(remaining, 1 << 20))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                ok, res = studio.import_session_zip(tmp_path, preferred_id)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if not ok:
+                return self._send(400, {"ok": False, "error": res})
+            return self._send(200, {"ok": True, "session": res})
+
         @staticmethod
         def _inside(root, rel):
             p = os.path.realpath(os.path.join(root, rel))
@@ -427,6 +534,9 @@ def make_handler(studio):
                 return self._send(200, jpeg, "image/jpeg")
             if path == "/api/drone/preview.mjpg":
                 return self._mjpeg(studio.drone)
+            m = re.match(r"^/api/sessions/([\w.-]+)/export$", path)
+            if m:
+                return self._export_session(m.group(1))
             m = re.match(r"^/api/jobs/(\d+)/log$", path)
             if m:
                 job = next((j for j in studio.queue.jobs if j.id == int(m.group(1))), None)
@@ -477,7 +587,14 @@ def make_handler(studio):
         # -------------------------------------------------------- POST --
 
         def do_POST(self):
-            path = urllib.parse.urlparse(self.path).path
+            url = urllib.parse.urlparse(self.path)
+            path = url.path
+            if path == "/api/sessions/import":
+                # Body is raw zip bytes, not JSON - must not go through
+                # _json_body() below, which would consume the whole
+                # request off the socket trying (and failing) to decode it.
+                preferred = urllib.parse.parse_qs(url.query).get("id", [None])[0]
+                return self._import_session(preferred)
             body = self._json_body()
             if path == "/api/record/start":
                 params = _merge(studio.settings["capture"], body.get("capture") or {})

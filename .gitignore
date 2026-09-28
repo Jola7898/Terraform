@@ -4,6 +4,11 @@
 # but not the chosen path going forward.
 /rtviomap/
 
+# Standalone phone/drone IMU dead-reckoning experiment (Madgwick + ZUPT) -
+# never got trajectory reconstruction to a usable quality. Kept on disk, not
+# in git.
+/rtvioimu/
+
 # Screenshots and presentation exports dropped at the repo root - not source.
 /image*.png
 /ppt_flowcharts/

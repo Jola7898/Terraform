@@ -50,6 +50,10 @@ START_CONFIRM_TIMEOUT_S = 8.0   # phone must report "recording" this soon after 
 RESUME_GRACE_S = 120.0          # a phone that drops mid-take may reconnect and keep uploading
 LEGACY_IDLE_FINALIZE_S = 3.0    # v1 app: its auto-session ends this long after frames stop
 SOCKET_IDLE_TIMEOUT_S = 15.0    # a v2 phone sends STATUS every second; silence this long = dead link
+SESSION_TRANSFER_IDLE_TIMEOUT_S = 120.0  # a bulk "Saved sessions -> Transfer" has no heartbeat at
+                                          # all - it's just raw file bytes, possibly hundreds of MB
+                                          # over WiFi - so it needs a much more generous idle window
+                                          # than the live stream's per-second STATUS check.
 STOP_RESEND_S = 2.0
 
 
@@ -292,24 +296,11 @@ class PhoneLink:
             self.listen_error = "cannot listen on %s:%d - %s" % (self.host, self.port, e)
             self._event(self.listen_error)
             return
-        srv.listen(2)
+        srv.listen(4)
         self._event("listening for the phone on %s:%d" % (self.host, self.port))
         while True:
             conn, addr = srv.accept()
-            # One phone at a time. A second connection is almost always the
-            # same phone auto-reconnecting after a WiFi blip before our end of
-            # the old socket noticed it was dead - so the new one wins.
-            with self._lock:
-                old = self._conn
-                self._conn = conn
-                self.peer = "%s:%d" % addr
-                self.connected_since = time.monotonic()
-                self.v2 = False
-                self.status = {}
-                self.status_at = None
-            if old is not None:
-                self._close(old)
-            threading.Thread(target=self._serve, args=(conn,), daemon=True,
+            threading.Thread(target=self._serve, args=(conn, addr), daemon=True,
                              name="phone-reader").start()
 
     @staticmethod
@@ -320,14 +311,52 @@ class PhoneLink:
             pass
         conn.close()
 
-    def _serve(self, conn):
+    def _serve(self, conn, addr):
+        claimed = False
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.settimeout(SOCKET_IDLE_TIMEOUT_S)
             conn.sendall(protocol.encode_handshake(protocol.STUDIO_PROTOCOL_VERSION))
+            header = protocol.recv_exact(conn, 1)[0]
+
+            if header == protocol.HEADER_SESSION_BEGIN:
+                # One-shot bulk copy (Saved sessions -> Transfer): a separate
+                # parallel channel from the "one phone" live-stream slot
+                # below, deliberately never registered as self._conn. It must
+                # never be evicted by - and must never evict - the live
+                # connection: a bare ReceiverProbe connect-then-close (fired
+                # right before every Transfer) used to be accepted here as
+                # "the phone reconnecting" and evict whatever was actually
+                # connected, and that connection's own reconnect could then
+                # turn around and evict the transfer itself mid-stream - a
+                # broken pipe on the phone's end. Deferring the "claim the
+                # slot" decision until after we know this isn't a transfer
+                # (below) fixes both directions at once. It also has no
+                # per-second heartbeat like a live stream does, so it gets
+                # its own, much longer idle timeout.
+                conn.settimeout(SESSION_TRANSFER_IDLE_TIMEOUT_S)
+                self._receive_session_transfer(conn)
+                return
+
+            # Anything else means this is the live-stream / remote-control
+            # connection. One phone at a time: a second one of these is
+            # almost always the same phone auto-reconnecting after a WiFi
+            # blip before our end of the old socket noticed it was dead - so
+            # the new one wins.
+            with self._lock:
+                old = self._conn
+                self._conn = conn
+                self.peer = "%s:%d" % addr
+                self.connected_since = time.monotonic()
+                self.v2 = False
+                self.status = {}
+                self.status_at = None
+            claimed = True
+            if old is not None:
+                self._close(old)
             self._event("phone connected from %s" % self.peer)
+
             while True:
-                header = protocol.recv_exact(conn, 1)[0]
                 if header == protocol.HEADER_FRAME:
                     self._on_frame(protocol.read_frame(conn))
                 elif header == protocol.HEADER_PREVIEW:
@@ -341,20 +370,18 @@ class PhoneLink:
                 elif header == protocol.HEADER_STATUS:
                     self._on_status(protocol.read_status(conn))
                 elif header == protocol.HEADER_SESSION_BEGIN:
-                    # One-shot bulk copy (Saved sessions -> Transfer), never
-                    # mixed with live streaming - handle it and stop, rather
-                    # than looping back to read another FRAME/IMU/... header
-                    # that will never come on this connection.
+                    conn.settimeout(SESSION_TRANSFER_IDLE_TIMEOUT_S)
                     self._receive_session_transfer(conn)
                     return
                 else:
                     raise protocol.StreamClosed("unknown packet header 0x%02X" % header)
+                header = protocol.recv_exact(conn, 1)[0]
         except (protocol.StreamClosed, OSError) as e:
             reason = "timed out" if isinstance(e, socket.timeout) else str(e)
             self._event("phone disconnected (%s)" % reason)
         finally:
             with self._lock:
-                if self._conn is conn:
+                if claimed and self._conn is conn:
                     self._conn = None
                     self.peer = None
                     self.connected_since = None
