@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Live reconstruction is back in RTVIO Studio, for the drone as well as the phone
+`vggt_live.py` (window-by-window VGGT reconstruction that starts while a take
+is still capturing, instead of waiting for it to finish) existed but was
+unreachable from the Studio: it listened on its own socket for a direct phone
+stream, and `phone_link.py`/`drone_link.py` already own the phone's TCP port
+and the drone's RTSP/MAVLink links respectively, so nothing could ever
+connect to it once the Studio was running.
+
+- New `vggt_live.py --tail SESSION_DIR` mode: instead of a socket, it watches
+  a `rtvio.studio` session directory that `phone_link.py`/`drone_link.py` are
+  already writing `frames/%06d.jpg` into live, and runs the same windowed
+  VGGT passes as they arrive. At finalize (`frame_timestamps.json`/
+  `gps_data.json` appearing) it swaps its own approximate arrival-order
+  timestamps for the take's authoritative ones before writing output, so a
+  live run's sidecars match a `--from-recording` run of the same take
+  exactly, not just its geometry.
+- `VGGTLiveReconstructor` (both `--tail` and the original `--port` socket
+  path) now threads a lens calibration and dynamic-object masker through to
+  `FrameLoader`/`_process_window`, matching the batch path - previously
+  neither live path undistorted frames at all, which would have silently fed
+  the drone's fisheye video to VGGT's pinhole model unstraightened.
+- Studio: a **Live reconstruct** checkbox next to Start recording on both the
+  Phone and Drone tabs. Checking it queues a `ReconJob` the moment recording
+  starts (`ReconQueue.submit_live`), not when it stops, so it holds the GPU -
+  and blocks any other queued reconstruction - for the whole take, the same
+  ~7-8 frames/s VGGT throughput ceiling documented in `vggt_live.py`. The
+  take's session card gets its live `recon_viz.py` view embedded right in
+  the recording panel as soon as the job is running, in addition to the
+  usual "Watch live" link in the sessions list. If a take was live-
+  reconstructed, the normal post-recording batch reconstruction is skipped
+  for it (`ReconQueue.busy_with` already covers the take for the job's
+  entire lifetime); "Reconstruct again" still works afterward as before.
+- Drone takes decide `--gps-mode`/`--intrinsics` for a live job from the
+  Studio's current Indoor/Outdoor switch and calibration
+  (`Studio.drone_live_recon_params`) rather than from `session_meta.json`,
+  which does not exist yet at record-start time.
+
 ### Drone camera lens calibration: frames undistorted before VGGT
 The drone's camera has a fisheye lens: straight walls and ceiling edges
 visibly bow in its frames. VGGT models a pinhole camera, so it settled on a

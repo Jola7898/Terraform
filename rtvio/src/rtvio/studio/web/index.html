@@ -55,9 +55,13 @@
       </div>
 
       <div class="card">
+        <label class="check small" id="droneLiveReconRow" title="Reconstructs window by window as the take records, instead of after it stops - holds the GPU for the whole take (~7-8 fps VGGT throughput), so no other reconstruction can run at the same time">
+          <input type="checkbox" id="droneLiveReconChk"> Live reconstruct
+        </label>
         <button id="droneRecordBtn" class="record-btn" disabled>Start recording</button>
         <div class="rec-stats" id="droneRecStats"></div>
         <div class="hint small muted" id="droneRecHint"></div>
+        <div id="droneLiveViz" class="live-viz hidden"><iframe id="droneLiveVizFrame" title="Live reconstruction"></iframe></div>
       </div>
 
       <details class="card" id="droneCalibCard">
@@ -139,9 +143,13 @@
       </div>
 
       <div class="card">
+        <label class="check small" id="liveReconRow" title="Reconstructs window by window as the take records, instead of after it stops - holds the GPU for the whole take (~7-8 fps VGGT throughput), so no other reconstruction can run at the same time">
+          <input type="checkbox" id="liveReconChk"> Live reconstruct
+        </label>
         <button id="recordBtn" class="record-btn" disabled>Start recording</button>
         <div class="rec-stats" id="recStats"></div>
         <div class="hint small muted" id="recHint"></div>
+        <div id="liveViz" class="live-viz hidden"><iframe id="liveVizFrame" title="Live reconstruction"></iframe></div>
       </div>
 
       <div class="card">

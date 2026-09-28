@@ -93,11 +93,18 @@ def next_video_out_dir(video_root, video_path):
 
 
 def build_command(kind, source, out_dir, params, viz_port=None):
-    """Maps the web UI's reconstruction options onto vggt_reconstruct's CLI.
-    kind: "recording" (source = session dir) or "video" (source = video file)."""
-    cmd = [sys.executable, "-u", "-m", "rtvio.vggt_reconstruct",
-           ("--video" if kind == "video" else "--from-recording"), source,
-           "--out", out_dir, "--progress", os.path.join(out_dir, "progress.json")]
+    """Maps the web UI's reconstruction options onto vggt_reconstruct's (or,
+    for a live take, vggt_live's --tail) CLI.
+    kind: "recording" (source = session dir), "video" (source = video file),
+    or "live" (source = session dir, reconstructed as it records - see
+    vggt_live.py's STUDIO-INTEGRATED LIVE PATH)."""
+    if kind == "live":
+        cmd = [sys.executable, "-u", "-m", "rtvio.vggt_live", "--tail", source,
+               "--out", out_dir, "--progress", os.path.join(out_dir, "progress.json")]
+    else:
+        cmd = [sys.executable, "-u", "-m", "rtvio.vggt_reconstruct",
+               ("--video" if kind == "video" else "--from-recording"), source,
+               "--out", out_dir, "--progress", os.path.join(out_dir, "progress.json")]
     flag_map = {
         "window_frames": "--window-frames", "overlap": "--overlap",
         "frame_stride": "--frame-stride", "conf_percentile": "--conf-percentile",
@@ -105,6 +112,11 @@ def build_command(kind, source, out_dir, params, viz_port=None):
         "voxel_factor": "--voxel-factor", "min_views": "--min-views",
         "max_frames": "--max-frames", "intrinsics": "--intrinsics",
     }
+    if kind == "live":
+        # A live take is reconstructed frame by frame as it arrives, so there
+        # is no whole file to stride through or truncate up front - vggt_live
+        # --tail has no --frame-stride/--max-frames of its own.
+        flag_map = {k: v for k, v in flag_map.items() if k not in ("frame_stride", "max_frames")}
     for key, flag in flag_map.items():
         v = params.get(key)
         if v not in (None, "", "auto"):
@@ -127,12 +139,13 @@ class ReconJob:
     _ids = iter(range(1, 1 << 30))
 
     def __init__(self, kind, source, params):
-        """kind: "recording" (source = a rtvio.studio session directory) or
-        "video" (source = a plain video file path, no phone involved)."""
+        """kind: "recording" (source = a rtvio.studio session directory),
+        "video" (source = a plain video file path, no phone involved), or
+        "live" (source = a session directory, reconstructed as it records)."""
         self.id = next(self._ids)
         self.kind = kind
         self.source = source
-        self.session_id = os.path.basename(source.rstrip("\\/")) if kind == "recording" else None
+        self.session_id = os.path.basename(source.rstrip("\\/")) if kind in ("recording", "live") else None
         self.label = self.session_id or os.path.splitext(os.path.basename(source))[0]
         self.params = dict(params)
         self.out_dir = None
@@ -207,6 +220,21 @@ class ReconQueue:
             self.jobs.append(job)
         self._wake.set()
         print("[recon] queued job %d for video %s" % (job.id, video_path), flush=True)
+        return job
+
+    def submit_live(self, session_dir, params):
+        """Starts reconstructing a take as it records, instead of waiting for
+        it to finish - see vggt_live.py's --tail. Submitted at record-start
+        time (unlike submit(), which server.py calls once a take is already
+        finalized), so this job's session_id is busy_with()-visible for the
+        whole recording: server.py checks that before auto-queuing the normal
+        post-recording batch job, so the two never run back to back on the
+        same take."""
+        job = ReconJob("live", session_dir, params)
+        with self._lock:
+            self.jobs.append(job)
+        self._wake.set()
+        print("[recon] queued live job %d for %s" % (job.id, job.session_id), flush=True)
         return job
 
     def cancel(self, job_id):

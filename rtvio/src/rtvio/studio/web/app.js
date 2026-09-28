@@ -136,6 +136,7 @@ function renderPhone(st) {
 
   $("recBadge").classList.toggle("hidden", !(rec && !rec.stopping));
   if (rec) $("recTime").textContent = fmtDur(rec.elapsed_s);
+  renderLiveViz(rec, st.jobs, "liveReconChk", "liveViz", "liveVizFrame");
   const stats = rec ? [
     [rec.frames.toLocaleString(), "frames received"],
     [rec.fps ? rec.fps.toFixed(1) : "–", "fps arriving"],
@@ -150,6 +151,22 @@ function renderPhone(st) {
   $("recStats").innerHTML = stats.map(([v, l]) => `<div><b>${v}</b><span>${l}</span></div>`).join("");
 }
 
+// Shows the embedded recon_viz.py panel for a running "live" job (see
+// jobs.py's ReconQueue.submit_live) matching the current recording, on
+// either source; hides it and re-enables the checkbox once there is none.
+function renderLiveViz(rec, jobs, chkId, boxId, frameId) {
+  $(chkId).disabled = !!rec;
+  const job = rec && (jobs || []).find((j) => j.kind === "live" && j.session === rec.id && j.state === "running");
+  const box = $(boxId), frame = $(frameId);
+  if (job && job.viz_url) {
+    if (frame.dataset.src !== job.viz_url) { frame.src = job.viz_url; frame.dataset.src = job.viz_url; }
+    box.classList.remove("hidden");
+  } else {
+    if (frame.dataset.src) { frame.removeAttribute("src"); frame.dataset.src = ""; }
+    box.classList.add("hidden");
+  }
+}
+
 function renderEvents(st) {
   const ev = st.phone.events.concat(st.drone.events.map(([t, e]) => [t, "[drone] " + e]));
   ev.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -161,7 +178,7 @@ $("recordBtn").addEventListener("click", async () => {
   btn.disabled = true;
   try {
     if (STATE && STATE.phone.recording) await api("POST", "/api/record/stop");
-    else await api("POST", "/api/record/start", {});
+    else await api("POST", "/api/record/start", { live: $("liveReconChk").checked });
   } catch (e) { alert(e.message); }
   pollState();
 });
@@ -246,6 +263,7 @@ function renderDrone(st) {
 
   $("droneRecBadge").classList.toggle("hidden", !rec);
   if (rec) $("droneRecTime").textContent = fmtDur(rec.elapsed_s);
+  renderLiveViz(rec, st.jobs, "droneLiveReconChk", "droneLiveViz", "droneLiveVizFrame");
   const lf = d.last_finalized;
   const stats = rec ? [
     [rec.frames.toLocaleString(), "frames saved"],
@@ -328,7 +346,7 @@ $("droneRecordBtn").addEventListener("click", async () => {
   $("droneRecordBtn").disabled = true;
   try {
     if (STATE && STATE.drone.recording) await api("POST", "/api/drone/record/stop");
-    else await api("POST", "/api/drone/record/start", {});
+    else await api("POST", "/api/drone/record/start", { live: $("droneLiveReconChk").checked });
   } catch (e) { alert(e.message); }
   pollState(); pollSessions();
 });

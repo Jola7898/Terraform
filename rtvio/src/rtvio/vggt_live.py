@@ -47,6 +47,21 @@ WHAT IS DIFFERENT FROM THE BATCH PATH
    same frame_timestamps.json/gps_data.json sidecars a phone recording uses,
    so the output directory is itself a valid --from-recording session if you
    ever want to reprocess it with different flags.
+
+STUDIO-INTEGRATED LIVE PATH (--tail)
+rtvio.studio owns the phone's TCP port (phone_link.py) and the drone's RTSP
++ MAVLink links (drone_link.py) itself, so this module's own socket receiver
+(above) can no longer sit in front of either source once the Studio is
+running. --tail SESSION_DIR is the Studio-compatible entry point instead:
+rather than receiving packets over a socket, it watches a session directory
+phone_link.py/drone_link.py are already writing to (frames/%06d.jpg as they
+arrive, frame_timestamps.json + gps_data.json once the take is finalized)
+and feeds the same VGGTLiveReconstructor windows from there - one reconstructor,
+two frame sources, so a --tail run and a --port run of the same footage still
+produce the same geometry. jobs.py's ReconQueue starts a --tail job the
+moment a take with "live reconstruct" checked begins recording (not when it
+ends), and it runs until the take is finalized, so it holds the GPU for the
+whole recording exactly like a real-time run would - see run_tail().
 """
 import argparse
 import json
@@ -61,12 +76,17 @@ from .vggt_reconstruct import (
     FrameLoader,
     Progress,
     _finalize_and_write,
+    _lens_profile,
     _load_vggt,
     _process_window,
+    _read_json_or_empty,
     _ReconState,
     auto_window_frames,
+    load_gps_track_from_recording,
     log,
 )
+
+TAIL_POLL_S = 0.5
 
 
 class VGGTLiveReconstructor:
@@ -78,7 +98,8 @@ class VGGTLiveReconstructor:
                 conf_percentile=DEPTH_CONF_PERCENTILE, edge_threshold=EDGE_REL_THRESH,
                 voxel_factor=1.0, min_views=2, poisson_depth=10, make_mesh=True,
                 gps_mode=None, ref_lat=None, ref_lon=None, ref_alt=None, extras=False,
-                cell_size_m=1.0, progress_path=None, viz=None):
+                cell_size_m=1.0, progress_path=None, viz=None,
+                camera=None, undistort_balance=0.0, masker=None):
         self.out_dir = out_dir
         self.frames_dir = os.path.join(out_dir, "frames")
         os.makedirs(self.frames_dir, exist_ok=True)
@@ -96,6 +117,15 @@ class VGGTLiveReconstructor:
         self.cell_size_m = cell_size_m
         self.progress = Progress(progress_path)
         self.viz = viz
+        # Lens undistortion (a calibrated drone's fisheye camera) and dynamic-
+        # object masking - the same two things FrameLoader/_process_window
+        # already do for the batch path (vggt_reconstruct.reconstruct_frames),
+        # threaded through here so a live/tail run of a drone take isn't
+        # silently fed distorted frames just because it took a different code
+        # path in.
+        self.camera = camera
+        self.undistort_balance = undistort_balance
+        self.masker = masker
 
         self.frame_paths = []          # shared by reference with self.loader.paths once it exists
         self.frame_times = []
@@ -139,12 +169,19 @@ class VGGTLiveReconstructor:
         if self.loader is None:
             # FrameLoader keeps the exact list object we keep appending to,
             # so later frames need no separate hand-off into it.
-            self.loader = FrameLoader(self.frame_paths)
+            self.loader = FrameLoader(self.frame_paths, masker=self.masker, camera=self.camera,
+                                      undistort_balance=self.undistort_balance)
             tokens = (self.loader.H // 14) * (self.loader.W // 14)
             log("input: live stream, %dx%d%s -> VGGT %dx%d (%d tokens/frame)"
                 % (self.loader.src_size[0], self.loader.src_size[1],
                    ", portrait -> rotated to landscape" if self.loader.rotated else "",
                    self.loader.W, self.loader.H, tokens))
+            u = self.loader.undistort_info
+            if u:
+                log("lens: %s, %.0f x %.0f deg -> every frame undistorted to a pinhole %.0f x %.0f deg "
+                    "(fx %.1f px at %dx%d) before VGGT" % (u["model"], u["lens_hfov"], u["lens_vfov"],
+                                                           u["pinhole_hfov"], u["pinhole_vfov"], u["fx"],
+                                                           u["width"], u["height"]))
             if self.window_frames in (None, "auto", "0", 0):
                 import torch
                 free_mb = torch.cuda.mem_get_info()[0] / 1e6 if self.device == "cuda" else 8000
@@ -162,7 +199,7 @@ class VGGTLiveReconstructor:
             end = self.start + self.window
             try:
                 kept, thresh, seam, dt, blur_stats = _process_window(
-                    self.model, self.device, self.dtype, self.loader, None,
+                    self.model, self.device, self.dtype, self.loader, self.masker,
                     self.start, end, self.conf_percentile, self.edge_threshold,
                     self.voxel_factor, self.state, prefetch_range=None, viz=self.viz)
             except torch.OutOfMemoryError:
@@ -211,7 +248,7 @@ class VGGTLiveReconstructor:
             end = n
             try:
                 kept, thresh, seam, dt, blur_stats = _process_window(
-                    self.model, self.device, self.dtype, self.loader, None,
+                    self.model, self.device, self.dtype, self.loader, self.masker,
                     self.start, end, self.conf_percentile, self.edge_threshold,
                     self.voxel_factor, self.state, prefetch_range=None, viz=self.viz)
                 self._log_window(self.start, end, dt, kept, thresh, seam, blur_stats, tail=True)
@@ -249,13 +286,99 @@ class VGGTLiveReconstructor:
             self.conf_percentile, 1, peak_mb, gpu_name=gpu_name, viz=self.viz)
 
 
+class _FramePkt:
+    """Minimal stand-in for stream.protocol's frame packet - only the .jpeg
+    attribute VGGTLiveReconstructor.on_frame reads."""
+    __slots__ = ("jpeg",)
+
+    def __init__(self, jpeg):
+        self.jpeg = jpeg
+
+
+def run_tail(session_dir, rec, poll_s=TAIL_POLL_S):
+    """Feeds `rec` (a VGGTLiveReconstructor) frames from a session directory
+    that phone_link.py/drone_link.py are writing to live, instead of from a
+    network socket - see the module docstring's STUDIO-INTEGRATED LIVE PATH.
+    Blocks until the take is finalized (frame_timestamps.json appears) or the
+    session directory disappears (the take was discarded - e.g. the phone
+    never confirmed START), then runs _finalize_and_write exactly as
+    on_session_end would for a real network stream."""
+    frames_dir = os.path.join(session_dir, "frames")
+    timestamps_path = os.path.join(session_dir, "frame_timestamps.json")
+    rec.on_session_start(None, None)
+    seen = 0
+    last_progress = 0.0
+    while True:
+        got_any = False
+        while os.path.exists(os.path.join(frames_dir, "%06d.jpg" % seen)):
+            path = os.path.join(frames_dir, "%06d.jpg" % seen)
+            try:
+                with open(path, "rb") as f:
+                    jpeg = f.read()
+            except OSError:
+                # a frame file can be mid-write the instant its name appears -
+                # retry it next poll rather than feeding a truncated JPEG.
+                break
+            rec.on_frame(time.monotonic(), _FramePkt(jpeg))
+            seen += 1
+            got_any = True
+        if os.path.exists(timestamps_path):
+            break
+        if not os.path.isdir(session_dir):
+            log("session directory disappeared before it was finalized "
+                "(the take was probably discarded) - nothing to reconstruct")
+            return
+        now = time.monotonic()
+        if got_any or now - last_progress > 2.0:
+            last_progress = now
+            rec.progress.update(stage="live", detail="%d frames received, reconstructing as they arrive" % seen,
+                                fraction=None, frames=seen)
+        time.sleep(poll_s)
+
+    # The take is finalized - frame_timestamps.json/gps_data.json now hold
+    # the session's authoritative per-frame times and GPS fixes. This process
+    # only ever saw approximate arrival times (good enough to start each
+    # window early), so swap them for the real ones before the run's own
+    # output/georeferencing is written - a --tail run and a --from-recording
+    # run of the same take then produce identical sidecars, not just the same
+    # geometry.
+    with open(timestamps_path) as f:
+        raw_times = json.load(f)
+    if len(raw_times) == len(rec.frame_times):
+        rec.frame_times = [round(t, 6) if t is not None else t for t in raw_times]
+    else:
+        log("WARNING: this run saw %d frames but the finalized take reports %d - "
+            "keeping this run's own arrival-order timestamps" % (len(rec.frame_times), len(raw_times)))
+    gps_track = load_gps_track_from_recording(session_dir)
+    if gps_track:
+        rec.gps_track = [{"t": g["t"], "lat": g["lat"], "lon": g["lon"], "alt": g["alt"]} for g in gps_track]
+    rec.on_session_end(None)
+
+
 def build_argparser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5555)
+    ap.add_argument("--tail", default=None, metavar="SESSION_DIR",
+                    help="Studio-integrated mode: reconstruct a rtvio.studio session directory "
+                         "live, as phone_link.py/drone_link.py write its frames, instead of "
+                         "listening on --host/--port for a direct socket stream")
+    ap.add_argument("--poll-s", type=float, default=TAIL_POLL_S, help="--tail only: how often to check "
+                    "the session directory for new frames")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--progress", default=None, help="write progress JSON here (used by rtvio.studio)")
+    ap.add_argument("--intrinsics", default=None, metavar="JSON",
+                    help="lens calibration (camera_model profile, e.g. data/drone_camera.json) to "
+                         "undistort frames with, if the source itself carries none of its own")
+    ap.add_argument("--no-undistort", action="store_true",
+                    help="feed frames to VGGT as captured even if a lens calibration is available")
+    ap.add_argument("--undistort-balance", type=float, default=0.0,
+                    help="0 (default) = crop the lens's outermost edge so no black border remains; "
+                         "1 = keep the whole field of view (black corners, stretched edges)")
+    ap.add_argument("--no-masking", action="store_true", help="(default) no dynamic-object masking")
+    ap.add_argument("--masking", action="store_true", help="mask people/vehicles with YOLO before VGGT")
+    ap.add_argument("--masking-preset", choices=["coco", "nadir_aerial"], default="coco")
     ap.add_argument("--window-frames", default="auto")
     ap.add_argument("--overlap", type=int, default=WINDOW_OVERLAP, help="frames shared by neighbouring windows")
     ap.add_argument("--conf-percentile", type=float, default=DEPTH_CONF_PERCENTILE)
@@ -277,25 +400,63 @@ def build_argparser():
                          "--viz-port. Preview only - see recon_viz.py")
     ap.add_argument("--viz-port", type=int, default=8766)
     ap.add_argument("--open", action="store_true", help="open the --live-viz page in a browser tab")
+    ap.add_argument("--no-viz-hold", action="store_true",
+                    help="exit as soon as the run finishes instead of keeping the --live-viz server up "
+                         "for Ctrl-C - for callers (rtvio.studio) that manage this process's lifecycle "
+                         "themselves and need it to actually exit when done")
     return ap
+
+
+def _build_reconstructor(args, viz):
+    camera = _lens_profile(args.intrinsics, undistort=not args.no_undistort)
+    masker = None
+    if args.masking and not args.no_masking:
+        from .ai_masking import DynamicMasker
+        masker = DynamicMasker.for_nadir_aerial() if args.masking_preset == "nadir_aerial" else DynamicMasker()
+    return VGGTLiveReconstructor(
+        args.out, window_frames=args.window_frames, overlap=args.overlap,
+        conf_percentile=args.conf_percentile, edge_threshold=args.edge_threshold,
+        voxel_factor=args.voxel_factor, min_views=args.min_views,
+        poisson_depth=args.poisson_depth, make_mesh=not args.no_mesh,
+        gps_mode=args.gps_mode, ref_lat=args.ref_lat, ref_lon=args.ref_lon, ref_alt=args.ref_alt,
+        extras=args.extras, cell_size_m=args.cell_size_m, progress_path=args.progress, viz=viz,
+        camera=camera, undistort_balance=args.undistort_balance, masker=masker,
+    )
 
 
 def main():
     args = build_argparser().parse_args()
     os.makedirs(args.out, exist_ok=True)
-    from .stream.source import SocketPacketSource, StreamSession
-    log("RTVIO live VGGT receiver on %s:%d (Ctrl-C to stop) -> %s" % (args.host, args.port, args.out))
 
     viz = None
     if args.live_viz:
         from .recon_viz import ReconViz
-        viz = ReconViz(args.out, port=args.viz_port, title=os.path.basename(os.path.normpath(args.out))).start()
+        title = os.path.basename(os.path.normpath(args.tail if args.tail else args.out))
+        viz = ReconViz(args.out, port=args.viz_port, title=title).start()
         url = "http://localhost:%d" % args.viz_port
         log("live viewer: %s" % url)
         if args.open:
             import threading
             import webbrowser
             threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    if args.tail:
+        log("RTVIO live VGGT: tailing %s -> %s" % (args.tail, args.out))
+        progress = Progress(args.progress)
+        try:
+            rec = _build_reconstructor(args, viz)
+            run_tail(args.tail, rec, poll_s=args.poll_s)
+        except Exception as e:
+            # Keep the last reported stage/window so the UI can say where it died.
+            progress.state = _read_json_or_empty(args.progress)
+            progress.update(stage="error", error="%s: %s" % (type(e).__name__, e), detail="failed")
+            raise
+        finally:
+            _hold_or_stop_viz(viz, args, url if args.live_viz else None)
+        return
+
+    from .stream.source import SocketPacketSource, StreamSession
+    log("RTVIO live VGGT receiver on %s:%d (Ctrl-C to stop) -> %s" % (args.host, args.port, args.out))
 
     # SocketPacketSource accepts exactly one connection per call, then closes
     # its listening socket - fine for a real phone, but the app's own
@@ -310,14 +471,7 @@ def main():
     # nothing; wrong here, where it usually just means a probe), so that has
     # to be caught too, not merely a small frame count checked afterward.
     while True:
-        rec = VGGTLiveReconstructor(
-            args.out, window_frames=args.window_frames, overlap=args.overlap,
-            conf_percentile=args.conf_percentile, edge_threshold=args.edge_threshold,
-            voxel_factor=args.voxel_factor, min_views=args.min_views,
-            poisson_depth=args.poisson_depth, make_mesh=not args.no_mesh,
-            gps_mode=args.gps_mode, ref_lat=args.ref_lat, ref_lon=args.ref_lon, ref_alt=args.ref_alt,
-            extras=args.extras, cell_size_m=args.cell_size_m, progress_path=args.progress, viz=viz,
-        )
+        rec = _build_reconstructor(args, viz)
         source = SocketPacketSource(args.host, args.port)
         try:
             StreamSession(source, [rec]).run()
@@ -328,7 +482,13 @@ def main():
             break
         log("(that connection carried no data - probably a reachability check, not a real "
             "stream; listening again)")
-    if viz is not None:
+    _hold_or_stop_viz(viz, args, url if args.live_viz else None)
+
+
+def _hold_or_stop_viz(viz, args, url):
+    if viz is None:
+        return
+    if not args.no_viz_hold:
         # Stay up so the browser tab can fetch the finished mesh/cloud once
         # the 'report' SSE message tells it to - see the matching comment in
         # vggt_reconstruct.main().
@@ -338,7 +498,7 @@ def main():
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
-        viz.stop()
+    viz.stop()
 
 
 if __name__ == "__main__":

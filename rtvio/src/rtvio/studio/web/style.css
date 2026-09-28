@@ -99,6 +99,9 @@ details.card[open] > summary { margin-bottom: 12px; }
 .rec-stats b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
 .rec-stats span { font-size: 11px; color: var(--muted); }
 .hint { margin-top: 8px; min-height: 1em; }
+.live-viz { margin-top: 12px; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--line); background: #0b0d10; }
+.live-viz iframe { width: 100%; height: 100%; border: 0; display: block; }
 
 /* ---------------------------------------------------------------- forms */
 .form { display: flex; flex-direction: column; gap: 10px; }

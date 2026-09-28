@@ -148,13 +148,20 @@ class Studio:
     # ---------------------------------------------------------- sessions --
 
     def _on_finalized(self, session_dir, meta):
-        if self.settings.get("auto_reconstruct", True):
+        # If "live reconstruct" was checked when this take started, a "live"
+        # job has been running against it since - see submit_live() below -
+        # and stays busy_with() this session_id through its own finalize and
+        # export, well past this callback. Queuing the normal batch job on
+        # top of it would just repeat the same GPU work for no benefit.
+        if self.settings.get("auto_reconstruct", True) and not self.queue.busy_with(meta["id"]):
             self.queue.submit(session_dir, self.recon_params(session_dir))
 
     def _on_drone_finalized(self, session_dir, meta):
         # Unlike a phone take (settings.auto_reconstruct), a drone take goes
-        # to the GPU the moment it is saved.
-        self.queue.submit(session_dir, self.recon_params(session_dir))
+        # to the GPU the moment it is saved - unless a live job already
+        # covered it (see _on_finalized's comment).
+        if not self.queue.busy_with(meta["id"]):
+            self.queue.submit(session_dir, self.recon_params(session_dir))
 
     def recon_params(self, session_dir, overrides=None):
         """settings.recon - except that a drone take is reconstructed in the
@@ -178,6 +185,19 @@ class Studio:
                     and not os.path.exists(os.path.join(session_dir, "camera_intrinsics.json"))):
                 params["intrinsics"] = self.drone.camera_path
         return _merge(params, overrides or {})
+
+    def drone_live_recon_params(self, session_dir):
+        """recon_params()'s drone overrides, computed from the drone's
+        current Indoor/Outdoor setting and calibration instead of from
+        session_meta.json - a live job starts at record-start time, before
+        the take (and that file) exists. Once the take finalizes, its own
+        camera_intrinsics.json/GPS track are still what vggt_live --tail
+        actually reconstructs with (see run_tail); this only decides what to
+        ask for up front."""
+        overrides = {"gps_mode": "global" if self.settings["drone"]["mode"] == "outdoor" else "off"}
+        if self.drone.camera is not None:
+            overrides["intrinsics"] = self.drone.camera_path
+        return self.recon_params(session_dir, overrides)
 
     def session_dir(self, sid):
         if not SESSION_ID_RE.match(sid or ""):
@@ -462,12 +482,18 @@ def make_handler(studio):
             if path == "/api/record/start":
                 params = _merge(studio.settings["capture"], body.get("capture") or {})
                 ok, res = studio.phone.start_recording(params)
+                if ok and body.get("live"):
+                    d = studio.session_dir(res)
+                    studio.queue.submit_live(d, studio.recon_params(d))
                 return self._send(200 if ok else 409, {"ok": ok, "session": res} if ok else {"ok": False, "error": res})
             if path == "/api/record/stop":
                 ok, res = studio.phone.stop_recording()
                 return self._send(200 if ok else 409, {"ok": ok, "session": res} if ok else {"ok": False, "error": res})
             if path == "/api/drone/record/start":
                 ok, res = studio.drone.start_recording()
+                if ok and body.get("live"):
+                    d = studio.session_dir(res)
+                    studio.queue.submit_live(d, studio.drone_live_recon_params(d))
                 return self._send(200 if ok else 409, {"ok": ok, "session": res} if ok else {"ok": False, "error": res})
             if path == "/api/drone/record/stop":
                 ok, res = studio.drone.stop_recording()
