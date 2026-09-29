@@ -20,6 +20,7 @@ class SettingsManager(context: Context) {
     companion object {
         const val KEY_SERVER_IP = "server_ip"
         const val KEY_SERVER_PORT = "server_port"
+        const val KEY_SERVER_PASSWORD = "server_password"
         const val KEY_RESOLUTION = "video_resolution"
         const val KEY_ASPECT = "video_aspect"
         const val KEY_FPS = "video_fps"
@@ -42,6 +43,11 @@ class SettingsManager(context: Context) {
     var serverIp: String
         get() = prefs.getString(KEY_SERVER_IP, "").orEmpty().trim()
         set(value) = prefs.edit().putString(KEY_SERVER_IP, value.trim()).apply()
+
+    /** Studio password, only used when [serverIp] is an https:// address. */
+    var serverPassword: String
+        get() = prefs.getString(KEY_SERVER_PASSWORD, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_SERVER_PASSWORD, value).apply()
 
     /** Clamped into the spec's 1024-65535 range; a junk value falls back to 5555. */
     var serverPort: Int

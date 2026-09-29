@@ -94,7 +94,7 @@ class RecordingsActivity : AppCompatActivity() {
                 ).show()
                 return@launch
             }
-            val result = SessionTransferClient.transfer(entry.dir, host, port)
+            val result = SessionTransferClient.transfer(entry.dir, host, port, settings.serverPassword)
             dialog.dismiss()
             result.onSuccess {
                 Snackbar.make(

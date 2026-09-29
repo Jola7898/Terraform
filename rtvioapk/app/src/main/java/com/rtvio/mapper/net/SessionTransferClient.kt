@@ -31,6 +31,7 @@ object SessionTransferClient {
         sessionDir: File,
         host: String,
         port: Int,
+        password: String = "",
         onProgress: (Progress) -> Unit = {}
     ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
@@ -38,9 +39,7 @@ object SessionTransferClient {
             if (files.isEmpty()) return@withContext Result.failure(IOException("nothing to send in ${sessionDir.name}"))
             val totalBytes = files.sumOf { it.length() }
 
-            Socket().use { sock ->
-                sock.tcpNoDelay = true
-                sock.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+            Transport.open(host, port, password, CONNECT_TIMEOUT_MS).use { sock ->
 
                 // The handshake is optional and ignored either way: a plain
                 // v1 receiver that has no idea what a session transfer is

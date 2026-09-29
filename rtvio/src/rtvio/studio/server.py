@@ -31,11 +31,13 @@ import hashlib
 import hmac
 import http.client
 import http.cookies
+import base64
 import json
 import os
 import re
 import shutil
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -408,6 +410,63 @@ class Studio:
         }
 
 
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_frame(opcode, payload=b""):
+    """One unmasked server->client WebSocket frame (RFC 6455)."""
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([n])
+    elif n < 1 << 16:
+        head += b"~" + struct.pack(">H", n)
+    else:
+        head += b"" + struct.pack(">Q", n)
+    return head + payload
+
+
+def _read_exact(rfile, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = rfile.read(n - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+
+def _ws_read_message(rfile, wfile_lock, wfile):
+    """Next binary/text message from the client (unmasking, reassembling
+    fragments, answering pings). Returns None on close."""
+    data, opcode0 = b"", None
+    while True:
+        b0, b1 = _read_exact(rfile, 2)
+        fin, op = b0 & 0x80, b0 & 0x0F
+        n = b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", _read_exact(rfile, 2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", _read_exact(rfile, 8))[0]
+        mask = _read_exact(rfile, 4) if b1 & 0x80 else None
+        payload = _read_exact(rfile, n) if n else b""
+        if mask:
+            payload = bytes(a ^ mask[i & 3] for i, a in enumerate(payload)) if n < 256 else                 (int.from_bytes(payload, "big") ^ int.from_bytes((mask * (n // 4 + 1))[:n], "big")).to_bytes(n, "big")
+        if op == 0x8:
+            return None
+        if op == 0x9:
+            with wfile_lock:
+                wfile.write(_ws_frame(0xA, payload)); wfile.flush()
+            continue
+        if op == 0xA:
+            continue
+        if op in (0x1, 0x2):
+            opcode0 = op
+        data += payload
+        if fin:
+            return data
+
+
 def make_handler(studio, password=None, cors_origins=()):
     # Stateless session token: an HMAC of the password, so a sign-in survives
     # a Studio restart and changing the password signs every browser out.
@@ -486,7 +545,7 @@ def make_handler(studio, password=None, cors_origins=()):
             # Any request body is left unread, so this connection cannot be
             # reused for another request.
             self.close_connection = True
-            if path.startswith(("/api/", "/files/", "/video_files/", "/viz/")):
+            if path.startswith(("/api/", "/files/", "/video_files/", "/viz/", "/ws/")):
                 return self._send(401, {"error": "sign in required"}, extra={"Connection": "close"})
             self.send_response(303)
             self.send_header("Location", "/login")
@@ -717,6 +776,66 @@ def make_handler(studio, password=None, cors_origins=()):
                 return self._send(400, {"ok": False, "error": res})
             return self._send(200, {"ok": True, "session": res})
 
+        def _ws_phone(self):
+            """WebSocket -> the phone TCP port. Carries the phone app's byte
+            stream unchanged (each binary message is a slice of it), so
+            phone_link.py needs no changes and the app can reach the Studio
+            through anything that passes HTTPS (Tailscale Funnel, Cloudflare
+            Tunnel), where the raw TCP port cannot go."""
+            key = self.headers.get("Sec-WebSocket-Key")
+            if (self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
+                return self._send(400, {"error": "websocket upgrade required"})
+            try:
+                tcp = socket.create_connection(("127.0.0.1", studio.phone_port), timeout=5)
+            except OSError:
+                return self._send(503, {"error": "phone receiver not running"})
+            accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+            self.close_connection = True
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            self.end_headers()
+            self.wfile.flush()
+            tcp.settimeout(None)
+            lock = threading.Lock()
+
+            def tcp_to_ws():
+                try:
+                    while True:
+                        chunk = tcp.recv(1 << 16)
+                        if not chunk:
+                            break
+                        with lock:
+                            self.wfile.write(_ws_frame(0x2, chunk)); self.wfile.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    with lock:
+                        self.wfile.write(_ws_frame(0x8, struct.pack(">H", 1000))); self.wfile.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            threading.Thread(target=tcp_to_ws, daemon=True, name="ws-phone-down").start()
+            self.connection.settimeout(None)
+            try:
+                while True:
+                    msg = _ws_read_message(self.rfile, lock, self.wfile)
+                    if msg is None:
+                        break
+                    tcp.sendall(msg)
+            except (EOFError, OSError):
+                pass
+            finally:
+                try:
+                    tcp.close()
+                except OSError:
+                    pass
+
         def _proxy_viz(self, rest):
             """Relays /viz/<rest> to the running job's recon_viz server on
             127.0.0.1 (jobs.py gives every job the same port), streaming the
@@ -781,6 +900,8 @@ def make_handler(studio, password=None, cors_origins=()):
                                         "authed": self._authorized()})
             if not self._authorized():
                 return self._reject(path)
+            if path == "/ws/phone":
+                return self._ws_phone()
             if path == "/viz":
                 self.send_response(301)
                 self.send_header("Location", "/viz/")

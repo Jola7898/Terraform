@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Phone app streams through the HTTPS tunnel
+The Studio serves `/ws/phone`, a WebSocket carrying the phone app's normal
+byte stream to its TCP receiver (phone_link.py unchanged). The app treats a
+Server IP starting with `https://` as the Studio's public URL: it signs in
+with the new Studio password setting and streams over the WebSocket
+(`net/Transport.kt`), on any network. This works through Tailscale Funnel or
+Cloudflare Tunnel, which cannot carry the raw TCP port.
+
 ### RTVIO Studio can run as a remote processing server behind a Vercel-hosted UI
 The Studio assumed the browser, the phone and the drone were all on the GPU
 PC's LAN. The web UI can now be deployed on Vercel and drive the PC over a

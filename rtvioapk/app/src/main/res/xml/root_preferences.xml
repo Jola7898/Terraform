@@ -12,6 +12,13 @@
             app:useSimpleSummaryProvider="false" />
 
         <EditTextPreference
+            android:key="server_password"
+            android:title="@string/pref_server_password"
+            android:summary="@string/pref_server_password_summary"
+            android:dialogTitle="@string/pref_server_password"
+            app:useSimpleSummaryProvider="false" />
+
+        <EditTextPreference
             android:key="server_port"
             android:title="@string/pref_server_port"
             android:defaultValue="5555"

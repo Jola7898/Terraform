@@ -87,6 +87,9 @@ dependencies {
     // NOTE: the spec listed androidx.legacy:legacy-support-v4 "for logging".
     // Logging is android.util.Log, which is in the platform. Dropped.
 
+    // Tunnel transport (net/Transport.kt): WebSocket to the Studio's /ws/phone.
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'

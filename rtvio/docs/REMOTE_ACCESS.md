@@ -140,6 +140,17 @@ Open the Vercel URL on any device:
   readout and queued on the PC's GPU. Uploads have no GPS track, so they are
   reconstructed vision-only.
 
+## 4b. Phone app through the tunnel (no Tailscale on the phone)
+
+The Studio relays the phone app's stream over a WebSocket at `/ws/phone`, so
+it goes through the same HTTPS address as the website (Funnel or Cloudflare),
+on any network including mobile data. In the app's Settings set **Server IP**
+to the public address (`https://<pc>.<tailnet>.ts.net`, or your
+`https://studio.yourdomain.com`) and **Studio password** to the Studio's
+password, then Test connection. A bare IP still uses raw TCP (LAN/Tailscale)
+as before. Live streaming is bandwidth-limited by the tunnel: lower the
+resolution or JPEG quality if it stutters.
+
 ## 5. Phone app and drone from anywhere: add Tailscale (optional)
 
 Cloudflare only carries web traffic. For the **phone app's live stream**

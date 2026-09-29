@@ -186,7 +186,7 @@ class SettingsFragment : PreferenceFragmentCompat(),
         pref.isEnabled = false
 
         lifecycleScope.launch {
-            val result = StreamClient.testConnection(host, settings.serverPort)
+            val result = StreamClient.testConnection(host, settings.serverPort, settings.serverPassword)
             pref.isEnabled = true
             pref.summary = result.fold(
                 onSuccess = { it },

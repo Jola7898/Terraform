@@ -2,8 +2,6 @@ package com.rtvio.mapper.net
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.net.InetSocketAddress
-import java.net.Socket
 
 /**
  * "Is anything listening at Settings -> Server IP right now?" - the check
@@ -22,8 +20,7 @@ object ReceiverProbe {
         if (host.isBlank()) return false
         return withContext(Dispatchers.IO) {
             try {
-                Socket().use { it.connect(InetSocketAddress(host, port), timeoutMs) }
-                true
+                Transport.isReachable(host, port, timeoutMs)
             } catch (e: Exception) {
                 false
             }

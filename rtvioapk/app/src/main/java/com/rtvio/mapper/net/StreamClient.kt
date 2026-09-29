@@ -139,7 +139,7 @@ class StreamClient(
 
     // ------------------------------------------------------------ lifecycle
 
-    fun start(host: String, port: Int, autoReconnect: Boolean, baseBackoffSec: Int) {
+    fun start(host: String, port: Int, autoReconnect: Boolean, baseBackoffSec: Int, password: String = "") {
         if (running) return
         running = true
         startedAtMs = System.currentTimeMillis()
@@ -147,7 +147,7 @@ class StreamClient(
 
         val s = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope = s
-        s.launch { connectionLoop(host, port, autoReconnect, baseBackoffSec * 1000L) }
+        s.launch { connectionLoop(host, port, autoReconnect, baseBackoffSec * 1000L, password) }
         s.launch { statsTicker() }
     }
 
@@ -309,7 +309,8 @@ class StreamClient(
         host: String,
         port: Int,
         autoReconnect: Boolean,
-        baseBackoffMs: Long
+        baseBackoffMs: Long,
+        password: String
     ) {
         var backoff = baseBackoffMs
         var attempt = 0
@@ -319,12 +320,7 @@ class StreamClient(
             _connection.value = ConnectionInfo(ConnectionState.CONNECTING, host, port, "", attempt)
             var sock: Socket? = null
             try {
-                sock = Socket().apply {
-                    tcpNoDelay = true          // frames are latency-sensitive
-                    keepAlive = true
-                    sendBufferSize = SEND_BUFFER_BYTES
-                    connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
-                }
+                sock = Transport.open(host, port, password, CONNECT_TIMEOUT_MS)
                 socket = sock
 
                 val (handshakeDetail, version) = readGreeting(sock)
@@ -533,12 +529,11 @@ class StreamClient(
          * Connects, waits for the greeting, then disconnects without sending
          * anything. Returns a human-readable result either way.
          */
-        suspend fun testConnection(host: String, port: Int): Result<String> =
+        suspend fun testConnection(host: String, port: Int, password: String = ""): Result<String> =
             withContext(Dispatchers.IO) {
                 val startNs = System.nanoTime()
                 try {
-                    Socket().use { s ->
-                        s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+                    Transport.open(host, port, password, CONNECT_TIMEOUT_MS).use { s ->
                         val connectMs = (System.nanoTime() - startNs) / 1e6
                         s.soTimeout = HANDSHAKE_TIMEOUT_MS
                         val ack = try {

@@ -232,10 +232,14 @@ class StreamingSession(
 
         // Streaming over cellular to a LAN address cannot work, so this is a
         // hard stop rather than a warning.
-        registerWifiWatch()
-        if (!isWifiConnected()) {
-            unregisterWifiWatch()
-            return "Connect to WiFi first"
+        // A tunnel (https:// address) works over any network, so the WiFi
+        // requirement only applies to a raw LAN connection.
+        if (!com.rtvio.mapper.net.Transport.isTunnel(host)) {
+            registerWifiWatch()
+            if (!isWifiConnected()) {
+                unregisterWifiWatch()
+                return "Connect to WiFi first"
+            }
         }
 
         startedAtMs = System.currentTimeMillis()
@@ -250,7 +254,8 @@ class StreamingSession(
             host = host,
             port = settings.serverPort,
             autoReconnect = settings.autoReconnect,
-            baseBackoffSec = settings.reconnectIntervalSec
+            baseBackoffSec = settings.reconnectIntervalSec,
+            password = settings.serverPassword
         )
         s.launch { client.connection.collect { info -> main.post { onConnection(info) } } }
         s.launch {
