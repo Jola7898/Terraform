@@ -249,8 +249,9 @@ def _load_vggt(device):
         sys.path.insert(0, vggt_root)
     from vggt.models.vggt import VGGT
 
-    if device == "cuda":
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    on_cuda = device.startswith("cuda")
+    if on_cuda:
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
     else:
         dtype = torch.float32
     default_ckpt = os.path.join(os.path.dirname(__file__), "..", "..", "data", "models", "vggt1b_model.pt")
@@ -266,11 +267,11 @@ def _load_vggt(device):
     if dtype != torch.float32:
         model.aggregator = model.aggregator.to(dtype)
     model = model.to(device).eval()
-    if device == "cuda":
-        torch.cuda.synchronize()
-        log("model on GPU: %.0f MB (%s aggregator), %.0f MB free of %.0f MB"
-            % (torch.cuda.memory_allocated() / 1e6, str(dtype).replace("torch.", ""),
-               torch.cuda.mem_get_info()[0] / 1e6, torch.cuda.get_device_properties(0).total_memory / 1e6))
+    if on_cuda:
+        torch.cuda.synchronize(device)
+        log("model on %s: %.0f MB (%s aggregator), %.0f MB free of %.0f MB"
+            % (device, torch.cuda.memory_allocated(device) / 1e6, str(dtype).replace("torch.", ""),
+               torch.cuda.mem_get_info(device)[0] / 1e6, torch.cuda.get_device_properties(device).total_memory / 1e6))
     return model, dtype
 
 
@@ -280,14 +281,15 @@ def _vggt_forward(model, imgs, device, dtype):
     import torch
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     x = imgs[None]
-    autocast = device == "cuda" and dtype != torch.float32
+    dev_type = device.split(":")[0]
+    autocast = dev_type == "cuda" and dtype != torch.float32
     with torch.no_grad():
-        with torch.autocast(device_type=device, dtype=dtype, enabled=autocast):
+        with torch.autocast(device_type=dev_type, dtype=dtype, enabled=autocast):
             toks, ps = model.aggregator(x)
         heads_autocast = autocast and dtype == torch.bfloat16 and HEADS_IN_BF16
         if not heads_autocast:
             toks = [t.float() if t is not None else None for t in toks]
-        with torch.autocast(device_type=device, dtype=dtype, enabled=heads_autocast):
+        with torch.autocast(device_type=dev_type, dtype=dtype, enabled=heads_autocast):
             pose_enc = model.camera_head(toks)[-1]
             depth, conf = model.depth_head(toks, x, ps, frames_chunk_size=DPT_FRAMES_CHUNK)
         del toks
@@ -501,6 +503,17 @@ class _ReconState:
         self.seams = []             # per-window alignment diagnostics
         self.blur = []              # per-window motion-blur summary (or None), parallel to windows processed
         self.wi = 0                 # windows successfully processed (excludes OOM retries)
+        self.gps_guide = None       # gps_seams.GpsSeamGuide under --gps-mode guided
+
+
+def _chain_through_shared_camera(prev, off, k, R_cw, C, s, device):
+    """Rigid (R, t) placing this window, scaled by s, so its last shared camera lands on its pose in prev."""
+    import torch
+    from .so3 import rigid_from_pose_pair
+    Rg, Cg = prev["R_cw"][off + k - 1].cpu().numpy(), prev["C"][off + k - 1].cpu().numpy()
+    R_np, t_np = rigid_from_pose_pair(Rg, Cg, R_cw[k - 1].cpu().numpy(), s * C[k - 1].cpu().numpy())
+    return (torch.tensor(R_np, dtype=torch.float32, device=device),
+            torch.tensor(t_np, dtype=torch.float32, device=device))
 
 
 def _process_window(model, device, dtype, loader, masker, start, end,
@@ -525,20 +538,35 @@ def _process_window(model, device, dtype, loader, masker, start, end,
 
     Returns (kept_frac, thresh, seam, dt, blur_stats) for the caller to log.
     """
+    t_w = time.monotonic()
+    loaded = loader.get(range(start, end))
+    if prefetch_range is not None:
+        loader.prefetch(prefetch_range)
+    raw = _forward_window(model, device, dtype, loaded)
+    kept, thresh, seam, blur_stats = _integrate_window(raw, loader, masker, start, end, conf_percentile,
+                                                       edge_threshold, voxel_factor, state, viz)
+    return kept, thresh, seam, time.monotonic() - t_w, blur_stats
+
+
+def _forward_window(model, device, dtype, loaded):
+    """VGGT on one window's decoded frames; the raw per-frame outputs stay on `device`. May raise OOM."""
+    import torch
+    rgb = torch.from_numpy(np.stack([im for im, _ in loaded])).to(device, non_blocking=True)
+    imgs = rgb.permute(0, 3, 1, 2).float().div_(255.0)
+    extr, intr, depth, conf = _vggt_forward(model, imgs, device, dtype)
+    return {"device": device, "loaded": loaded, "rgb": rgb, "extr": extr, "intr": intr, "depth": depth, "conf": conf}
+
+
+def _integrate_window(raw, loader, masker, start, end, conf_percentile, edge_threshold, voxel_factor,
+                      state, viz=None):
+    """Aligns one window's raw VGGT output onto state.prev and fuses it, on the raw output's own device."""
     import torch
     from .fusion import unproject, continuity_mask, pixel_normals, confidence_keep, robust_sim3
     from .fusion import VoxelAccumulator
-    from .so3 import rigid_from_pose_pair
 
     idxs = list(range(start, end))
-    t_w = time.monotonic()
-    loaded = loader.get(idxs)
-    if prefetch_range is not None:
-        loader.prefetch(prefetch_range)
-
-    rgb = torch.from_numpy(np.stack([im for im, _ in loaded])).to(device, non_blocking=True)
-    imgs = rgb.permute(0, 3, 1, 2).float().div_(255.0)
-    extr, intr, depth, conf = _vggt_forward(model, imgs, device, dtype)   # may raise OOM
+    device, loaded, rgb = raw["device"], raw["loaded"], raw["rgb"]
+    extr, intr, depth, conf = raw["extr"], raw["intr"], raw["depth"], raw["conf"]
 
     # ---- per-pixel geometry, all on the GPU
     R_cw = extr[:, :3, :3].transpose(1, 2)
@@ -555,6 +583,10 @@ def _process_window(model, device, dtype, loader, masker, start, end,
 
     # ---- align onto the previous window
     prev = state.prev
+    if prev is not None and prev["P"].device != P.device:
+        o = start - prev["start"]
+        prev = dict(start=start, end=prev["end"],
+                    **{key: prev[key][o:].to(P.device) for key in ("P", "valid", "depth", "R_cw", "C")})
     if prev is None:
         s, R, t = 1.0, torch.eye(3, device=device), torch.zeros(3, device=device)
         seam = None
@@ -572,16 +604,24 @@ def _process_window(model, device, dtype, loader, masker, start, end,
             # Too little confident overlap (e.g. a whip pan between the
             # shared frames): fall back to chaining through one shared
             # camera, with the scale from the two windows' depth ratio.
-            Rg, Cg = prev["R_cw"][off + k - 1].cpu().numpy(), prev["C"][off + k - 1].cpu().numpy()
             dl = depth[k - 1][valid[k - 1]]
             dg = prev["depth"][off + k - 1][prev["valid"][off + k - 1]]
             s = float(dg.median() / dl.median()) if dl.numel() and dg.numel() else 1.0
-            R_np, t_np = rigid_from_pose_pair(Rg, Cg, R_cw[k - 1].cpu().numpy(), s * C[k - 1].cpu().numpy())
-            R = torch.tensor(R_np, dtype=torch.float32, device=device)
-            t = torch.tensor(t_np, dtype=torch.float32, device=device)
+            R, t = _chain_through_shared_camera(prev, off, k, R_cw, C, s, device)
             seam = dict(window=state.wi, method="single-camera fallback", shared_frames=k,
                         n=n_corr, scale=s, inlier_frac=None, median_rel_residual=None)
             log("  WARNING: only %d confident shared pixels - fell back to single-camera chaining" % n_corr)
+        if state.gps_guide is not None:
+            dense = seam["method"] == "dense-sim3"
+            use_gps, s_gps, sig = state.gps_guide.check(idxs, C.double().cpu().numpy(), s, dense)
+            seam.update(gps_scale=s_gps, gps_scale_sigma=sig)
+            if use_gps:
+                log("  GPS scale %.4f (+-%.1f%%) replaces %s scale %.4f"
+                    % (s_gps, 100 * sig, "dense" if dense else "fallback", s))
+                seam.update(method="gps-scale " + ("override" if dense else "fallback"), vision_scale=s,
+                            scale=s_gps, median_rel_residual=None)
+                s = s_gps
+                R, t = _chain_through_shared_camera(prev, off, k, R_cw, C, s, device)
         state.seams.append(seam)
 
     P_g = s * torch.einsum("ij,shwj->shwi", R, P) + t
@@ -618,10 +658,13 @@ def _process_window(model, device, dtype, loader, masker, start, end,
         if idx not in state.poses:
             state.poses[idx] = (R_np[j], C_np[j], K_np[j])
 
+    if state.gps_guide is not None:
+        state.gps_guide.update(state.poses)
+
     state.prev = {"start": start, "end": end, "P": P_g, "valid": valid, "depth": depth_g,
                   "R_cw": R_cw_g, "C": C_g}
-    if device == "cuda":
-        torch.cuda.synchronize()
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
     state.wi += 1
 
     blur_vals = {i: loader.blur[i] for i in idxs if i in loader.blur}
@@ -633,8 +676,7 @@ def _process_window(model, device, dtype, loader, masker, start, end,
     state.blur.append(blur_stats)
 
     kept = float(valid.float().mean())
-    dt = time.monotonic() - t_w
-    return kept, thresh, seam, dt, blur_stats
+    return kept, thresh, seam, blur_stats
 
 
 def _finalize_and_write(state, frame_paths, frame_times, loader, out_dir, progress,
@@ -669,7 +711,7 @@ def _finalize_and_write(state, frame_paths, frame_times, loader, out_dir, progre
     cam_C = np.array([state.poses[i][1] for i in frame_ids])
     cam_R = np.array([state.poses[i][0] for i in frame_ids])
     georef = None
-    if gps_mode == "global" and gps_track:
+    if gps_mode in ("global", "guided") and gps_track:
         georef = _georeference_global(cam_C, [frame_times[i] for i in frame_ids], gps_track,
                                       ref_lat, ref_lon, ref_alt)
     if georef is not None:
@@ -745,7 +787,8 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
                        poisson_depth=10, make_mesh=True, gps_mode=None,
                        ref_lat=None, ref_lon=None, ref_alt=None,
                        use_masking=False, masking_preset="coco", extras=False,
-                       cell_size_m=1.0, viz=None, camera=None, undistort_balance=0.0):
+                       cell_size_m=1.0, viz=None, camera=None, undistort_balance=0.0, gps_sigma_m=3.0,
+                       gpus=1):
     import torch
 
     progress = progress or Progress(None)
@@ -771,8 +814,17 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
     else:
         log("WARNING: no CUDA device - running VGGT on the CPU will be extremely slow")
 
+    devices = [device]
+    if device == "cuda" and gpus > 1:
+        g = min(gpus, torch.cuda.device_count())
+        if g < gpus:
+            log("WARNING: --gpus %d requested but only %d CUDA device(s) visible" % (gpus, g))
+        if g > 1:
+            devices = ["cuda:%d" % i for i in range(g)]
+
     progress.update(stage="loading", detail="loading VGGT-1B", fraction=0.0, frames=n)
-    model, dtype = _load_vggt(device)
+    models = [_load_vggt(d) for d in devices]
+    model, dtype = models[0]
 
     masker = None
     if use_masking:
@@ -792,7 +844,7 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
                                                    u["width"], u["height"]))
 
     if window_frames in (None, "auto", "0", 0):
-        free_mb = torch.cuda.mem_get_info()[0] / 1e6 if device == "cuda" else 8000
+        free_mb = min(torch.cuda.mem_get_info(d)[0] for d in devices) / 1e6 if device == "cuda" else 8000
         window = auto_window_frames(tokens, loader.H * loader.W, free_mb)
         log("auto window: %d frames per VGGT pass (%.0f MB VRAM free)" % (window, free_mb))
     else:
@@ -802,8 +854,66 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
     est_windows = 1 if n <= window else 1 + math.ceil((n - window) / (window - overlap))
 
     state = _ReconState()
+    if gps_mode == "guided" and gps_track:
+        from .gps_seams import GpsSeamGuide
+        r0 = (ref_lat, ref_lon, ref_alt) if ref_lat is not None else \
+            (gps_track[0]["lat"], gps_track[0]["lon"], gps_track[0]["alt"])
+        state.gps_guide = GpsSeamGuide(gps_enu_for_frames(frame_times, gps_track, *r0, max_gap_s=1.0),
+                                       sigma_m=gps_sigma_m)
+        log("GPS-guided seams: sigma %.1f m per fix" % gps_sigma_m)
+    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else None
+    if len(devices) > 1:
+        gpu_name = "%d x %s" % (len(devices), gpu_name)
+        window, overlap, window_times, vggt_s = _run_windows_multi(
+            models, devices, loader, masker, n, window, overlap, conf_percentile, edge_threshold,
+            voxel_factor, state, progress, viz, gpu_name, t_start)
+    else:
+        window, overlap, window_times = _run_windows_single(
+            model, device, dtype, loader, masker, n, window, overlap, est_windows, conf_percentile,
+            edge_threshold, voxel_factor, state, progress, viz, gpu_name, t_start)
+        vggt_s = sum(d for _, d in window_times)
+
+    loader.close()
+    peak_mb = max(torch.cuda.max_memory_allocated(d) for d in devices) / 1e6 if device == "cuda" else 0.0
+    del state.prev
+    if device == "cuda":
+        for d in devices:
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
+
+    return _finalize_and_write(
+        state, frame_paths, frame_times, loader, out_dir, progress,
+        gps_mode, gps_track, ref_lat, ref_lon, ref_alt,
+        min_views, make_mesh, poisson_depth, extras, cell_size_m,
+        window, overlap, vggt_s, lambda: time.monotonic() - t_start, conf_percentile, frame_stride,
+        peak_mb, gpu_name=gpu_name, viz=viz)
+
+
+def _report_window(state, start, end, dt, kept, thresh, seam, blur_stats, n, est_windows, window,
+                   rate, eta, progress, viz, gpu_name):
+    log("window %d: frames [%d:%d) %.2fs (%.1f frames/s), %.0f%% px kept, conf>=%.3g%s"
+        % (state.wi, start, end, dt, (end - start) / dt, 100 * kept, thresh,
+           "" if seam is None else ", seam s=%.4f resid=%s" % (
+               seam["scale"], "%.3f" % seam["median_rel_residual"] if seam["median_rel_residual"] is not None else "-")))
+    progress.update(stage="vggt", window=state.wi, windows=max(est_windows, state.wi),
+                    frames_done=end, fraction=0.85 * end / n,
+                    detail="VGGT window %d/%d · %.1f frames/s" % (state.wi, max(est_windows, state.wi), rate),
+                    eta_s=round(eta), vggt_fps=round(rate, 2), window_frames=window)
+    if viz is not None:
+        viz.push_window({
+            "window": state.wi, "windows_est": max(est_windows, state.wi),
+            "frames_done": end, "frames_total": n, "fps": round(rate, 2),
+            "kept_frac": kept, "conf_thresh": thresh, "gpu": gpu_name,
+            "seam": ({"method": seam["method"], "scale": seam["scale"],
+                      "median_rel_residual": seam.get("median_rel_residual")} if seam is not None else None),
+            "blur": blur_stats,
+        })
+
+
+def _run_windows_single(model, device, dtype, loader, masker, n, window, overlap, est_windows,
+                        conf_percentile, edge_threshold, voxel_factor, state, progress, viz, gpu_name, t_start):
+    import torch
     window_times = []
-    frames_done = 0
     start = 0
     loader.prefetch(range(0, _plan_next(0, n, window, overlap)))
 
@@ -826,46 +936,96 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
             continue
 
         window_times.append((end - start, dt))
-        frames_done = end
         rate = sum(f for f, _ in window_times) / max(sum(d for _, d in window_times), 1e-6)
-        eta = (n - frames_done) / max(rate, 1e-6) + 0.15 * (time.monotonic() - t_start)
-        log("window %d: frames [%d:%d) %.2fs (%.1f frames/s), %.0f%% px kept, conf>=%.3g%s"
-            % (state.wi, start, end, dt, (end - start) / dt, 100 * kept, thresh,
-               "" if seam is None else ", seam s=%.4f resid=%s" % (
-                   seam["scale"], "%.3f" % seam["median_rel_residual"] if seam["median_rel_residual"] is not None else "-")))
-        progress.update(stage="vggt", window=state.wi, windows=max(est_windows, state.wi),
-                        frames_done=frames_done, fraction=0.85 * frames_done / n,
-                        detail="VGGT window %d/%d · %.1f frames/s" % (state.wi, max(est_windows, state.wi), rate),
-                        eta_s=round(eta), vggt_fps=round(rate, 2), window_frames=window)
-        if viz is not None:
-            viz.push_window({
-                "window": state.wi, "windows_est": max(est_windows, state.wi),
-                "frames_done": frames_done, "frames_total": n, "fps": round(rate, 2),
-                "kept_frac": kept, "conf_thresh": thresh,
-                "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
-                "seam": ({"method": seam["method"], "scale": seam["scale"],
-                          "median_rel_residual": seam.get("median_rel_residual")} if seam is not None else None),
-                "blur": blur_stats,
-            })
+        eta = (n - end) / max(rate, 1e-6) + 0.15 * (time.monotonic() - t_start)
+        _report_window(state, start, end, dt, kept, thresh, seam, blur_stats, n, est_windows, window,
+                       rate, eta, progress, viz, gpu_name)
         if next_start is None:
             break
         loader.release_before(next_start)
         start = next_start
+    return window, overlap, window_times
 
-    loader.close()
-    peak_mb = torch.cuda.max_memory_allocated() / 1e6 if device == "cuda" else 0.0
-    vggt_s = sum(d for _, d in window_times)
-    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else None
-    del state.prev
-    if device == "cuda":
-        torch.cuda.empty_cache()
 
-    return _finalize_and_write(
-        state, frame_paths, frame_times, loader, out_dir, progress,
-        gps_mode, gps_track, ref_lat, ref_lon, ref_alt,
-        min_views, make_mesh, poisson_depth, extras, cell_size_m,
-        window, overlap, vggt_s, lambda: time.monotonic() - t_start, conf_percentile, frame_stride,
-        peak_mb, gpu_name=gpu_name, viz=viz)
+def _run_windows_multi(models, devices, loader, masker, n, window, overlap, conf_percentile, edge_threshold,
+                       voxel_factor, state, progress, viz, gpu_name, t_start):
+    """One VGGT forward in flight per GPU; windows are still aligned and fused strictly in order, on their own GPU."""
+    import torch
+    G = len(devices)
+    pools = [ThreadPoolExecutor(max_workers=1) for _ in devices]
+
+    def plan(start, window, overlap):
+        wins = []
+        while True:
+            end = _plan_next(start, n, window, overlap)
+            wins.append((start, end))
+            if end >= n:
+                return wins
+            start = end - overlap
+
+    def forward(g, loaded):
+        with torch.cuda.device(devices[g]):
+            t = time.monotonic()
+            raw = _forward_window(models[g][0], devices[g], models[g][1], loaded)
+            torch.cuda.synchronize(devices[g])
+            return raw, time.monotonic() - t
+
+    # FrameLoader isn't thread-safe: every loader call stays on this thread; workers only see decoded arrays.
+    def submit(i):
+        s, e = wins[i]
+        loaded = loader.get(range(s, e))
+        if i + G < len(wins):
+            loader.prefetch(range(*wins[i + G]))
+        return pools[i % G].submit(forward, i % G, loaded)
+
+    wins = plan(0, window, overlap)
+    futs = {i: submit(i) for i in range(min(G, len(wins)))}
+    window_times, i, t0 = [], 0, time.monotonic()
+    try:
+        while i < len(wins):
+            s, e = wins[i]
+            try:
+                raw, dt_fwd = futs.pop(i).result()
+            except torch.OutOfMemoryError:
+                for f in futs.values():
+                    try:
+                        f.result()
+                    except Exception:                                  # noqa: BLE001
+                        pass
+                futs.clear()
+                for d in devices:
+                    with torch.cuda.device(d):
+                        torch.cuda.empty_cache()
+                if window <= AUTO_MIN_WINDOW:
+                    raise
+                window = max(AUTO_MIN_WINDOW, int(window * 0.75))
+                overlap = min(overlap, window // 2)
+                log("  out of VRAM - retrying with %d-frame windows" % window)
+                wins = wins[:i] + plan(s, window, overlap)
+                futs = {j: submit(j) for j in range(i, min(i + G, len(wins)))}
+                continue
+            # A GPU gets its next window only after this one is integrated, so its forward pass and
+            # this integration never compete for the same VRAM.
+            with torch.cuda.device(raw["device"]):
+                t = time.monotonic()
+                kept, thresh, seam, blur_stats = _integrate_window(raw, loader, masker, s, e, conf_percentile,
+                                                                   edge_threshold, voxel_factor, state, viz)
+                dt = dt_fwd + time.monotonic() - t
+            del raw
+            window_times.append((e - s, dt))
+            rate = e / max(time.monotonic() - t0, 1e-6)
+            eta = (n - e) / max(rate, 1e-6) + 0.15 * (time.monotonic() - t_start)
+            _report_window(state, s, e, dt, kept, thresh, seam, blur_stats, n, len(wins), window,
+                           rate, eta, progress, viz, gpu_name)
+            if i + 1 < len(wins):
+                loader.release_before(wins[i + 1][0])
+            if i + G < len(wins):
+                futs[i + G] = submit(i + G)
+            i += 1
+    finally:
+        for p in pools:
+            p.shutdown(wait=True, cancel_futures=True)
+    return window, overlap, window_times, time.monotonic() - t0
 
 
 # -------------------------------------------------------------- outputs --
@@ -998,7 +1158,8 @@ def _write_report(out_dir, **r):
     seams = r["seams"]
     scales = [s["scale"] for s in seams]
     resid = [s["median_rel_residual"] for s in seams if s.get("median_rel_residual") is not None]
-    fallbacks = sum(1 for s in seams if s["method"] != "dense-sim3")
+    fallbacks = sum(1 for s in seams if s["method"].endswith("fallback"))
+    gps_scaled = [s for s in seams if s["method"].startswith("gps-scale")]
     blur_all = [b for b in r.get("blur", []) if b is not None]
     gpu = r.get("gpu")
     lines = [
@@ -1042,7 +1203,8 @@ def _write_report(out_dir, **r):
                       "fits and the model's angles open up - calibrate the lens (Studio: Drone tab -> Camera "
                       "calibration, or tools/calibrate_camera.py --model auto)"
                       % (cam["vggt_fx_px"], cam["width"], cam["vggt_hfov_deg"])]
-    lines += ["", "## Window seams (vision-only Sim(3) alignment)", ""]
+    lines += ["", "## Window seams (Sim(3) alignment%s)" % (", GPS-guided" if any("gps_scale" in s for s in seams)
+                                                         else ", vision only"), ""]
     if seams:
         lines += ["- scale correction per seam: min %.4f, median %.4f, max %.4f (1.0 = VGGT kept the same scale)"
                   % (min(scales), float(np.median(scales)), max(scales))]
@@ -1051,6 +1213,10 @@ def _write_report(out_dir, **r):
         if fallbacks:
             lines += ["- WARNING: %d seam(s) had too little confident overlap and fell back to single-camera "
                       "chaining - look for a fast pan or a textureless view there" % fallbacks]
+        for s in gps_scaled:
+            lines += ["- window %d: GPS scale %.4f (+-%.1f%%) used instead of the vision %s scale %.4f"
+                      % (s["window"], s["scale"], 100 * s["gps_scale_sigma"],
+                         "dense" if s["method"].endswith("override") else "fallback", s["vision_scale"])]
     else:
         lines += ["- single window - no seams"]
     lines += ["", "## Motion blur (Laplacian variance of each frame - lower = blurrier)", ""]
@@ -1082,6 +1248,7 @@ def _write_report(out_dir, **r):
         "seam_scale_median": float(np.median(scales)) if scales else None,
         "seam_scale_max": max(scales) if scales else None,
         "seam_fallbacks": fallbacks,
+        "seam_gps_scaled": len(gps_scaled),
         "blur_median": float(np.median([b["median"] for b in blur_all])) if blur_all else None,
         "blur_worst": min((b["worst"] for b in blur_all), default=None),
         "blur_worst_frame": (min(blur_all, key=lambda b: b["worst"])["worst_frame"] if blur_all else None),
@@ -1128,10 +1295,15 @@ def main():
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--progress", default=None, help="write progress JSON here (used by rtvio.studio)")
     ap.add_argument("--gps", default=None, help="--video only: CSV timestamp_s,lat_deg,lon_deg,alt_m")
-    ap.add_argument("--gps-mode", choices=["off", "global"], default=None,
+    ap.add_argument("--gps-mode", choices=["off", "global", "guided"], default=None,
                     help="off: vision only (default for recordings - indoor GPS is noise). "
                          "global: one similarity fit of the whole trajectory to the GPS track "
-                         "(default when --gps is given)")
+                         "(default when --gps is given). guided: global, plus GPS overrules a "
+                         "window seam's scale when vision fell back or failed (see gps_seams.py)")
+    ap.add_argument("--gps-sigma-m", type=float, default=3.0,
+                    help="--gps-mode guided: per-fix GPS noise, metres")
+    ap.add_argument("--gpus", type=int, default=1,
+                    help="run consecutive windows' VGGT passes on this many GPUs at once (e.g. 2 on Kaggle's T4 x2)")
     ap.add_argument("--ref-lat", type=float, default=None)
     ap.add_argument("--ref-lon", type=float, default=None)
     ap.add_argument("--ref-alt", type=float, default=None)
@@ -1182,7 +1354,7 @@ def main():
                 use_masking=args.masking and not args.no_masking, masking_preset=args.masking_preset,
                 extras=args.extras, cell_size_m=args.cell_size_m,
                 intrinsics=args.intrinsics, undistort=not args.no_undistort,
-                undistort_balance=args.undistort_balance)
+                undistort_balance=args.undistort_balance, gps_sigma_m=args.gps_sigma_m, gpus=args.gpus)
     progress = Progress(args.progress)
 
     viz = None
