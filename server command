@@ -1,0 +1,6 @@
+open powershell as administrator
+
+run-
+
+cd G:\BS\Terraform\rtvio; powershell -ExecutionPolicy Bypass -File tools\start_studio_server.ps1 -Funnel
+
