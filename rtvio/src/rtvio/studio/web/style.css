@@ -145,3 +145,19 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 #viewerCanvas { flex: 1; min-height: 0; }
 .viewer-loading { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
   background: rgba(21,26,33,.9); border: 1px solid var(--line); padding: 12px 18px; border-radius: 10px; }
+
+/* ---------------------------------------------- remote gate (config.js) */
+.gate { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  background: var(--bg); padding: 16px; }
+.gate-box { width: min(420px, 100%); background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 24px; display: flex; flex-direction: column; gap: 14px; }
+.gate-box .brand { font-size: 18px; }
+.gate-box h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.gate-box p { margin: 0 0 10px; }
+.gate-box form { display: flex; flex-direction: column; gap: 10px; }
+.gate-box input { background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; font: inherit; }
+.gate-box .warn { color: var(--bad); min-height: 1.2em; }
+.dot-on, .dot-off { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.dot-on { background: var(--ok); }
+.dot-off { background: var(--bad); }

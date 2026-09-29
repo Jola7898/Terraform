@@ -9,11 +9,36 @@ let settingsDirty = 0;          // ms timestamp of the last local edit
 let SOURCE = "drone";           // which live source the left column shows
 let droneConnShown = false;
 
+/* ------------------------------------------------------ server address */
+// config.js sets RTVIO_API_URL when this page is hosted apart from the
+// processing PC (Vercel). Then every request goes to that URL with a bearer
+// token from sign-in, and the gate below covers the page while the PC is
+// offline. Empty: the page came from the Studio itself (cookie sign-in).
+const API = String(window.RTVIO_API_URL || "").replace(/\/+$/, "");
+const REMOTE = API !== "";
+const TOKEN_KEY = "rtvio_token";
+function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; } }
+function setToken(t) { try { if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY); } catch (e) { /* private mode */ } }
+function authHeaders() { return REMOTE && getToken() ? { Authorization: "Bearer " + getToken() } : {}; }
+// For URLs the browser loads by itself (<img>, <iframe>, links, PLYLoader):
+// those cannot carry a header, so the token rides in the query string.
+function u(path) {
+  if (!REMOTE) return path;
+  const t = getToken();
+  return API + path + (t ? (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t) : "");
+}
+function signInRequired() {
+  if (!REMOTE) { location.href = "/login"; return; }
+  setToken("");
+  gate("login");
+}
+
 async function api(method, path, body) {
-  const res = await fetch(path, {
-    method, headers: body ? { "Content-Type": "application/json" } : {},
+  const res = await fetch(API + path, {
+    method, headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...authHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (res.status === 401) { signInRequired(); throw new Error("sign in required"); }
   let data = null;
   try { data = await res.json(); } catch (e) { /* non-JSON */ }
   if (!res.ok) throw new Error((data && data.error) || res.statusText);
@@ -97,7 +122,7 @@ function renderPhone(st) {
   $("lanIps").innerHTML = (st.lan.length ? st.lan : ["<this PC's IP>"]).map((ip) => `${esc(ip)} : ${st.phone_port}`).join("<br>");
   if (p.listen_error) $("lanIps").innerHTML = `<span style="color:var(--bad)">${esc(p.listen_error)}</span>`;
   const hasFrame = p.connected, wantStream = hasFrame && SOURCE === "phone";
-  if (wantStream && !previewOn) { $("preview").src = "/api/preview.mjpg"; previewOn = true; }
+  if (wantStream && !previewOn) { $("preview").src = u("/api/preview.mjpg"); previewOn = true; }
   if (!wantStream && previewOn) { $("preview").removeAttribute("src"); previewOn = false; }
   $("previewEmpty").classList.toggle("hidden", hasFrame);
   $("phoneModel").textContent = p.connected ? `${s.model || ""}${s.app ? " · app " + s.app : ""}` : "";
@@ -159,7 +184,7 @@ function renderLiveViz(rec, jobs, chkId, boxId, frameId) {
   const job = rec && (jobs || []).find((j) => j.kind === "live" && j.session === rec.id && j.state === "running");
   const box = $(boxId), frame = $(frameId);
   if (job && job.viz_url) {
-    if (frame.dataset.src !== job.viz_url) { frame.src = job.viz_url; frame.dataset.src = job.viz_url; }
+    if (frame.dataset.src !== job.viz_url) { frame.src = u(job.viz_url); frame.dataset.src = job.viz_url; }
     box.classList.remove("hidden");
   } else {
     if (frame.dataset.src) { frame.removeAttribute("src"); frame.dataset.src = ""; }
@@ -204,7 +229,7 @@ function renderDrone(st) {
   $("dronePill").className = "pill " + pillCls;
 
   const wantStream = vid.connected && SOURCE === "drone";
-  if (wantStream && !dronePreviewOn) { $("dronePreview").src = "/api/drone/preview.mjpg"; dronePreviewOn = true; }
+  if (wantStream && !dronePreviewOn) { $("dronePreview").src = u("/api/drone/preview.mjpg"); dronePreviewOn = true; }
   if (!wantStream && dronePreviewOn) { $("dronePreview").removeAttribute("src"); dronePreviewOn = false; }
   $("droneEmpty").classList.toggle("hidden", vid.connected);
   $("droneEmptyTitle").textContent = !d.enabled ? "Drone link is off" : !d.video_source ? "Set the drone's IP" : "No drone video";
@@ -457,19 +482,19 @@ function renderSessionCard(s) {
     const title = `${s.id} / ${rec ? rec.name : ""}`;
     const running = job && ["queued", "running", "cancelling"].includes(job.state);
     const actions = [];
-    if (job && job.viz_url) actions.push(`<a class="btn" href="${job.viz_url}" target="_blank">Watch live</a>`);
+    if (job && job.viz_url) actions.push(`<a class="btn" href="${u(job.viz_url)}" target="_blank">Watch live</a>`);
     if (outs["cloud_raw.ply"]) actions.push(viewBtn(base, title, "cloud", `View cloud · ${fmtBytes(outs["cloud_raw.ply"])}`));
     if (outs["mesh_poisson.ply"]) actions.push(viewBtn(base, title, "mesh", `View mesh · ${fmtBytes(outs["mesh_poisson.ply"])}`));
-    if (outs["cloud_raw.ply"]) actions.push(`<a class="btn" href="${base}cloud_raw.ply" download="${s.id}_cloud_raw.ply">cloud_raw.ply</a>`);
-    if (outs["mesh_poisson.ply"]) actions.push(`<a class="btn" href="${base}mesh_poisson.ply" download="${s.id}_mesh_poisson.ply">mesh_poisson.ply</a>`);
-    if (outs["CHECKPOINT_REPORT.md"]) actions.push(`<a class="btn" href="${base}CHECKPOINT_REPORT.md" target="_blank">report</a>`);
-    if (m && !s.recording) actions.push(`<a class="btn" href="/api/sessions/${encodeURIComponent(s.id)}/export" download="${s.id}.zip">Export .zip</a>`);
+    if (outs["cloud_raw.ply"]) actions.push(`<a class="btn" href="${u(base + "cloud_raw.ply")}" download="${s.id}_cloud_raw.ply">cloud_raw.ply</a>`);
+    if (outs["mesh_poisson.ply"]) actions.push(`<a class="btn" href="${u(base + "mesh_poisson.ply")}" download="${s.id}_mesh_poisson.ply">mesh_poisson.ply</a>`);
+    if (outs["CHECKPOINT_REPORT.md"]) actions.push(`<a class="btn" href="${u(base + "CHECKPOINT_REPORT.md")}" target="_blank">report</a>`);
+    if (m && !s.recording) actions.push(`<a class="btn" href="${u(`/api/sessions/${encodeURIComponent(s.id)}/export`)}" download="${s.id}.zip">Export .zip</a>`);
     if (running && job.state !== "cancelling") actions.push(`<button data-cancel="${job.id}">Cancel</button>`);
     else if (m && !s.recording) actions.push(`<button data-recon="${s.id}">${rec ? "Reconstruct again" : "Reconstruct"}</button>`);
     if (job && job.state !== "queued") actions.push(`<button data-log="${job.id}">log</button>`);
     if (rec && !running) actions.push(`<button class="danger" data-delete-recon="${s.id}|${rec.name}">Delete</button>`);
     return `<div class="session${s.recording ? " live" : ""}">
-      ${s.thumb ? `<img src="/files/${encodeURIComponent(s.id)}/${s.thumb}" loading="lazy" alt="">` : `<img alt="">`}
+      ${s.thumb ? `<img src="${u(`/files/${encodeURIComponent(s.id)}/${s.thumb}`)}" loading="lazy" alt="">` : `<img alt="">`}
       <div>
         <div class="title">${esc(s.id)}</div>
         <div class="facts">${facts.join(" · ")}</div>
@@ -497,12 +522,12 @@ function renderVideoJobs() {
     const outs = vj.files;
     const running = ["queued", "running", "cancelling"].includes(vj.state);
     const actions = [];
-    if (vj.viz_url) actions.push(`<a class="btn" href="${vj.viz_url}" target="_blank">Watch live</a>`);
+    if (vj.viz_url) actions.push(`<a class="btn" href="${u(vj.viz_url)}" target="_blank">Watch live</a>`);
     if (outs["cloud_raw.ply"]) actions.push(viewBtn(base, vj.label, "cloud", `View cloud · ${fmtBytes(outs["cloud_raw.ply"])}`));
     if (outs["mesh_poisson.ply"]) actions.push(viewBtn(base, vj.label, "mesh", `View mesh · ${fmtBytes(outs["mesh_poisson.ply"])}`));
-    if (outs["cloud_raw.ply"]) actions.push(`<a class="btn" href="${base}cloud_raw.ply" download="${vj.label}_cloud_raw.ply">cloud_raw.ply</a>`);
-    if (outs["mesh_poisson.ply"]) actions.push(`<a class="btn" href="${base}mesh_poisson.ply" download="${vj.label}_mesh_poisson.ply">mesh_poisson.ply</a>`);
-    if (outs["CHECKPOINT_REPORT.md"]) actions.push(`<a class="btn" href="${base}CHECKPOINT_REPORT.md" target="_blank">report</a>`);
+    if (outs["cloud_raw.ply"]) actions.push(`<a class="btn" href="${u(base + "cloud_raw.ply")}" download="${vj.label}_cloud_raw.ply">cloud_raw.ply</a>`);
+    if (outs["mesh_poisson.ply"]) actions.push(`<a class="btn" href="${u(base + "mesh_poisson.ply")}" download="${vj.label}_mesh_poisson.ply">mesh_poisson.ply</a>`);
+    if (outs["CHECKPOINT_REPORT.md"]) actions.push(`<a class="btn" href="${u(base + "CHECKPOINT_REPORT.md")}" target="_blank">report</a>`);
     if (vj.job_id != null && running && vj.state !== "cancelling") actions.push(`<button data-cancel="${vj.job_id}">Cancel</button>`);
     if (vj.job_id != null && vj.state !== "queued") actions.push(`<button data-log="${vj.job_id}">log</button>`);
     if (!running) actions.push(`<button class="danger" data-delete-video="${vj.dir}">Delete</button>`);
@@ -547,26 +572,89 @@ async function onJobsClick(ev) {
 $("sessions").addEventListener("click", onJobsClick);
 $("videoJobs").addEventListener("click", onJobsClick);
 
+/* ------------------------------------------------------------- uploads */
+// Files go up in chunks (server.py "chunked uploads"): each request stays
+// under Cloudflare's 100 MB cap, and a dropped connection costs one chunk -
+// it is retried from the size the server reports. XHR rather than fetch()
+// for per-chunk upload progress.
+const CHUNK_BYTES = 32 * 1024 * 1024;
+
+function postChunk(id, offset, blob, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API}/api/uploads/${id}?offset=${offset}`);
+    const h = authHeaders();
+    Object.keys(h).forEach((k) => xhr.setRequestHeader(k, h[k]));
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { /* non-JSON */ }
+      if (xhr.status === 401) { signInRequired(); reject(new Error("sign in required")); }
+      else if (data && typeof data.size === "number" && (xhr.status === 200 || xhr.status === 409)) resolve(data.size);
+      else reject(new Error((data && data.error) || `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error("connection lost"));
+    xhr.send(blob);
+  });
+}
+
+async function uploadChunked(file, statusEl, label) {
+  const { id } = await api("POST", "/api/uploads");
+  let offset = 0, failures = 0;
+  while (offset < file.size) {
+    try {
+      offset = await postChunk(id, offset, file.slice(offset, offset + CHUNK_BYTES), (sent) => {
+        const done = offset + sent;
+        statusEl.textContent = `uploading ${label}: ${fmtBytes(done)} / ${fmtBytes(file.size)} (${Math.round(100 * done / file.size)}%)`;
+      });
+      failures = 0;
+    } catch (e) {
+      if (e.message === "sign in required" || ++failures > 5) throw e;
+      statusEl.textContent = `uploading ${label}: connection dropped, retrying (${failures}/5)…`;
+      await new Promise((r) => setTimeout(r, 2000 * failures));
+    }
+  }
+  return id;
+}
+
 $("importSessionFile").addEventListener("change", async (ev) => {
   const file = ev.target.files[0];
+  ev.target.value = "";
   if (!file) return;
   const status = $("importStatus");
   status.textContent = `uploading ${file.name}…`;
   try {
-    // Raw file bytes as the body - no multipart needed for a single file,
-    // and the server streams this straight to disk rather than parsing it.
-    const res = await fetch("/api/sessions/import", { method: "POST", body: file });
-    const data = await res.json().catch(() => null);
-    if (!res.ok) throw new Error((data && data.error) || res.statusText);
+    const id = await uploadChunked(file, status, file.name);
+    status.textContent = `importing ${file.name}…`;
+    const data = await api("POST", `/api/sessions/import?upload=${id}`);
     status.textContent = `imported as ${data.session}`;
     pollSessions();
   } catch (e) {
     status.textContent = "";
     alert("Import failed: " + e.message);
-  } finally {
-    ev.target.value = "";
   }
 });
+
+// Uploads one clip to the processing PC and queues it.
+async function uploadVideo(ev) {
+  const file = ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  const status = $("videoUploadStatus");
+  const name = file.name && /\.\w+$/.test(file.name) ? file.name : "capture.mp4";
+  status.textContent = `uploading ${name}…`;
+  try {
+    const id = await uploadChunked(file, status, name);
+    await api("POST", `/api/upload-video?upload=${id}&name=${encodeURIComponent(name)}`);
+    status.textContent = `${name} uploaded - reconstruction queued`;
+    pollVideoJobs();
+  } catch (e) {
+    status.textContent = "";
+    alert("Upload failed: " + e.message);
+  }
+}
+$("videoUploadFile").addEventListener("change", uploadVideo);
+$("videoCaptureFile").addEventListener("change", uploadVideo);
 
 $("videoReconBtn").addEventListener("click", async () => {
   // "Copy as path" in Explorer quotes the path; drop the quotes.
@@ -581,9 +669,17 @@ $("videoReconBtn").addEventListener("click", async () => {
 
 /* ------------------------------------------------------------- polling */
 
+// READY: the page may talk to the server. Always true when the Studio
+// served this page; for a remote page, only once the PC answered and we are
+// signed in (see checkServer).
+let READY = !REMOTE;
+let pollFails = 0;
+
 async function pollState() {
+  if (!READY) return;
   try {
     STATE = await api("GET", "/api/state");
+    pollFails = 0;
     renderPhone(STATE);
     renderDrone(STATE);
     renderEvents(STATE);
@@ -593,17 +689,83 @@ async function pollState() {
   } catch (e) {
     $("phonePill").textContent = "studio server unreachable";
     $("phonePill").className = "pill pill-off";
+    // A few misses in a row (not one blip): the PC went away.
+    if (REMOTE && READY && ++pollFails >= 3) checkServer();
   }
 }
 async function pollVideoJobs() {
+  if (!READY) return;
   try { VIDEO_JOBS = await api("GET", "/api/video-jobs"); renderVideoJobs(); } catch (e) { /* next tick */ }
 }
 async function pollSessions() {
+  if (!READY) return;
   try { SESSIONS = await api("GET", "/api/sessions"); renderSessions(); } catch (e) { /* next tick */ }
 }
 
+/* ---------------------------------------------------------------- gate */
+// Remote page only: covers the UI with "offline" while the PC does not
+// answer (off, no internet, Studio not running - Cloudflare's error page for
+// a down tunnel carries no CORS header, so it lands here as a failed fetch
+// too), or with a sign-in form once it does.
+
+const CHECK_EVERY_S = 10;
+let checkTimer = null;
+
+function gate(mode) {     // "checking" | "offline" | "login" | null (hidden)
+  READY = mode === null;
+  $("gate").classList.toggle("hidden", mode === null);
+  $("gateChecking").classList.toggle("hidden", mode !== "checking");
+  $("gateOffline").classList.toggle("hidden", mode !== "offline");
+  $("gateLogin").classList.toggle("hidden", mode !== "login");
+  if (mode === "login") setTimeout(() => $("gatePassword").focus(), 0);
+}
+
+async function checkServer() {
+  clearTimeout(checkTimer);
+  let health = null;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const res = await fetch(API + "/api/health", { headers: authHeaders(), signal: ctl.signal, cache: "no-store" });
+    clearTimeout(t);
+    if (res.ok) health = await res.json();
+  } catch (e) { /* offline */ }
+  if (!health || !health.ok) {
+    gate("offline");
+    $("gateNext").textContent = `Last checked ${new Date().toLocaleTimeString()} - checking every ${CHECK_EVERY_S} s.`;
+    checkTimer = setTimeout(checkServer, CHECK_EVERY_S * 1000);
+    return;
+  }
+  if (health.auth_required && !health.authed) { setToken(""); gate("login"); return; }
+  gate(null);
+  pollFails = 0;
+  pollState(); pollSessions(); pollVideoJobs();
+}
+
+$("gateRetry").addEventListener("click", () => { gate("checking"); checkServer(); });
+$("gateLogin").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const err = $("gateError");
+  err.textContent = "";
+  try {
+    const res = await fetch(API + "/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: $("gatePassword").value }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data) throw new Error((data && data.error) || `HTTP ${res.status}`);
+    setToken(data.token);
+    $("gatePassword").value = "";
+    checkServer();
+  } catch (e) {
+    err.textContent = e instanceof TypeError ? "server unreachable" : e.message;
+    if (e instanceof TypeError) checkServer();
+  }
+});
+
 bindSettings();
-pollState(); pollSessions(); pollVideoJobs();
+if (REMOTE) { gate("checking"); checkServer(); }
+else { pollState(); pollSessions(); pollVideoJobs(); }
 setInterval(pollState, 1000);
 setInterval(pollSessions, 2500);
 setInterval(pollVideoJobs, 2500);
@@ -658,7 +820,7 @@ function resetView() {
 
 async function loadCams(base) {
   try {
-    const res = await fetch(base + "cameras.json");
+    const res = await fetch(u(base + "cameras.json"));
     if (!res.ok) return;
     const cams = await res.json();
     const pts = cams.centers.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
@@ -683,12 +845,12 @@ function showKind(kind) {
   const file = kind === "mesh" ? "mesh_poisson.ply" : "cloud_raw.ply";
   const base = V.base;
   $("viewerTitle").textContent = `${V.title} / ${file}`;
-  $("viewerDownload").href = base + file;
+  $("viewerDownload").href = u(base + file);
   $("viewerDownload").setAttribute("download", file);
   $("viewerLoading").classList.remove("hidden");
   $("viewerLoading").textContent = "loading " + file + "…";
   clearObj();
-  new THREE.PLYLoader().load(base + file, (geom) => {
+  new THREE.PLYLoader().load(u(base + file), (geom) => {
     $("viewerLoading").classList.add("hidden");
     geom.computeBoundingSphere();
     V.radius = Math.max(geom.boundingSphere.radius, 1e-6);

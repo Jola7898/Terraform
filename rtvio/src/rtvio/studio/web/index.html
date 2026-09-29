@@ -184,14 +184,26 @@
     <div class="card">
       <div class="card-head">
         <h2>Video file</h2>
-        <span class="muted small">no phone needed - reconstruct any local clip</span>
+        <span class="muted small">no phone app needed - upload a clip from this device, or record one</span>
       </div>
-      <div class="form">
-        <label>Path to video file, on this machine
-          <input type="text" id="videoPath" placeholder="C:\path\to\clip.mp4">
+      <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <label class="btn primary">Upload video &amp; reconstruct
+          <input type="file" id="videoUploadFile" accept="video/*" hidden>
+        </label>
+        <label class="btn">Record with camera
+          <input type="file" id="videoCaptureFile" accept="video/*" capture="environment" hidden>
         </label>
       </div>
-      <button id="videoReconBtn" class="record-btn">Reconstruct</button>
+      <div id="videoUploadStatus" class="small muted"></div>
+      <details style="margin-top:8px">
+        <summary class="small muted">…or a file already on the Studio PC</summary>
+        <div class="form">
+          <label>Path to video file, on the Studio PC
+            <input type="text" id="videoPath" placeholder="C:\path\to\clip.mp4">
+          </label>
+        </div>
+        <button id="videoReconBtn" class="record-btn">Reconstruct</button>
+      </details>
       <div id="videoJobs" class="sessions" style="margin-top:12px"></div>
     </div>
 
@@ -276,6 +288,29 @@
   <div id="viewerLoading" class="viewer-loading">loading…</div>
 </div>
 
+<!-- Shown only when this page is hosted apart from the processing PC
+     (config.js sets RTVIO_API_URL): PC offline, or not signed in yet. -->
+<div id="gate" class="gate hidden">
+  <div class="gate-box">
+    <div class="brand">RTVIO <span>Studio</span></div>
+    <div id="gateChecking" class="muted">Connecting to the processing server…</div>
+    <div id="gateOffline" class="hidden">
+      <h2><span class="dot-off"></span>Processing server is offline</h2>
+      <p class="muted">The GPU PC is switched off, not connected to the internet, or RTVIO Studio isn't
+        running on it. This page will connect by itself as soon as it's back.</p>
+      <p class="small muted" id="gateNext"></p>
+      <button id="gateRetry">Check now</button>
+    </div>
+    <form id="gateLogin" class="hidden">
+      <h2><span class="dot-on"></span>Processing server is online</h2>
+      <input type="password" id="gatePassword" placeholder="Studio password" autocomplete="current-password">
+      <button type="submit" class="primary">Sign in</button>
+      <div id="gateError" class="warn small"></div>
+    </form>
+  </div>
+</div>
+
+<script src="/static/config.js"></script>
 <script src="/static/vendor/three.min.js"></script>
 <script src="/static/vendor/OrbitControls.js"></script>
 <script src="/static/vendor/PLYLoader.js"></script>

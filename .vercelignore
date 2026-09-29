@@ -1,0 +1,9 @@
+# The Vercel build only needs the Studio web folder and the build script.
+*.mp4
+*.pdf
+rtvio/data/
+rtvio/tests/
+rtvio/third_party/
+rtvio/docs/
+rtvioapk/
+deploy/vercel/dist/

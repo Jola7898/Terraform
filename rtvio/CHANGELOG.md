@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### RTVIO Studio can run as a remote processing server behind a Vercel-hosted UI
+The Studio assumed the browser, the phone and the drone were all on the GPU
+PC's LAN. The web UI can now be deployed on Vercel and drive the PC over a
+Cloudflare Tunnel from anywhere, showing "Processing server is offline"
+when the PC isn't reachable (docs/REMOTE_ACCESS.md; Tailscale remains the
+route for the phone app's TCP stream and a field drone).
+
+- Password sign-in (`--password` / `RTVIO_STUDIO_PASSWORD`). A non-localhost
+  `--web-host`, or any `--cors-origin`, without one is refused
+  (`--no-auth` overrides the former only).
+- Cross-origin UI: `--cors-origin` / `RTVIO_STUDIO_CORS_ORIGINS` allow-list,
+  `POST /api/login` returns a bearer token, which is also accepted as
+  `?token=` for `<img>`/`<iframe>`/download URLs. The unauthenticated
+  `GET /api/health` is what the page polls to decide online/offline.
+- `web/config.js` (`RTVIO_API_URL`, empty = same origin) plus
+  `deploy/vercel/build.mjs` and `vercel.json`, which build the unchanged
+  Studio web folder into a static Vercel site.
+- Chunked, resumable uploads (`POST /api/uploads`, `/api/uploads/<id>?offset=`)
+  under Cloudflare's 100 MB request cap. The Video file card uses them to
+  upload a clip from the browsing device (or record one with a phone's
+  camera) and queue it via `/api/upload-video?upload=<id>`; session .zip
+  import uses them too. The server-path box is still there for files
+  already on the PC.
+- Each job's live 3D viewer is proxied through the Studio at `/viz/`
+  (behind the sign-in) instead of linking to `http://127.0.0.1:8767`, which
+  only ever worked on the server itself. recon_viz.py's page now uses
+  relative URLs (carrying its query string, for the token) so it works
+  under that prefix.
+- `tools/start_studio_server.ps1`: password and allowed-origin setup,
+  firewall rules limited to LAN + Tailscale, checks the cloudflared
+  service, starts the Studio. `-Funnel` publishes the Studio through
+  Tailscale Funnel instead (a free, fixed `https://<pc>.<tailnet>.ts.net`
+  address, no domain needed) and prints the URL for `RTVIO_API_URL`;
+  remembered across runs, `-NoFunnel` turns it off.
+
 ### Live reconstruction is back in RTVIO Studio, for the drone as well as the phone
 `vggt_live.py` (window-by-window VGGT reconstruction that starts while a take
 is still capturing, instead of waiting for it to finish) existed but was

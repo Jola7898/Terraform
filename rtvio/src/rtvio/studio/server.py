@@ -12,10 +12,25 @@ queues finished takes for reconstruction (a drone take always, the moment
 it stops), and opens cloud_raw.ply / mesh_poisson.ply in a 3D viewer.
 
 The web UI binds to 127.0.0.1 unless --web-host says otherwise: it can start
-the phone's camera and run GPU jobs, and has no authentication, so exposing
-it to the LAN is an explicit choice. The phone port has to be on the LAN.
+the phone's camera and run GPU jobs, so exposing it is an explicit choice,
+and one that needs --password (or RTVIO_STUDIO_PASSWORD) unless --no-auth
+says otherwise. The phone port has to be reachable from the phone.
+
+REMOTE USE (docs/REMOTE_ACCESS.md): this page can also be hosted on Vercel
+(web/config.js points it here) and reach this server through a Cloudflare
+Tunnel; --cors-origin names that site, which signs in via /api/login for a
+bearer token and polls the open /api/health to show "offline" when this PC
+is not reachable. Video files are uploaded in chunks (/api/uploads), and
+each job's live 3D viewer is proxied under /viz/ so it needs no extra open
+port. The phone's TCP stream and the drone's RTSP + MAVLink are not HTTP;
+from outside the LAN those go over Tailscale.
 """
 import argparse
+import fnmatch
+import hashlib
+import hmac
+import http.client
+import http.cookies
 import json
 import os
 import re
@@ -67,6 +82,19 @@ DEFAULT_SETTINGS = {
 }
 
 SESSION_ID_RE = re.compile(r"^[\w.-]+$")
+VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp")
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_CHUNK_BYTES = 96 * 1024 * 1024      # under Cloudflare's 100 MB request cap
+AUTH_COOKIE = "rtvio_auth"
+LOGIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>RTVIO Studio - sign in</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0d10;color:#cfd8e3;
+font:15px/1.4 -apple-system,Segoe UI,sans-serif}form{display:flex;flex-direction:column;gap:12px;width:min(320px,90vw)}
+input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #2a3340;background:#141920;color:inherit}
+button{background:#2f6fed;border-color:#2f6fed;color:#fff;cursor:pointer}.err{color:#ff7b7b;min-height:1.4em}</style>
+</head><body><form method="post" action="/login"><h2 style="margin:0">RTVIO Studio</h2>
+<input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
+<button type="submit">Sign in</button><div class="err">__ERROR__</div></form></body></html>"""
 PRIORITY_OUTPUTS = ("cloud_raw.ply", "mesh_poisson.ply")
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
@@ -113,6 +141,7 @@ class Studio:
         self.data_root = data_root
         self.sessions_root = os.path.join(data_root, "sessions")
         self.video_root = os.path.join(data_root, "video_jobs")
+        self.upload_root = os.path.join(data_root, "uploads")
         os.makedirs(self.sessions_root, exist_ok=True)
         os.makedirs(self.video_root, exist_ok=True)
         self.settings_path = os.path.join(data_root, "studio_settings.json")
@@ -302,8 +331,7 @@ class Studio:
                 "label": job.label if job else re.sub(r"-\d+$", "", name),
                 "job_id": job.id if job else None,
                 "state": job.state if job else None,
-                "viz_url": ("http://127.0.0.1:%d" % job.viz_port)
-                           if job and job.state == "running" and job.viz_port else None,
+                "viz_url": "/viz/" if job and job.state == "running" and job.viz_port else None,
                 "progress": prog,
                 "files": files,
             })
@@ -380,12 +408,108 @@ class Studio:
         }
 
 
-def make_handler(studio):
+def make_handler(studio, password=None, cors_origins=()):
+    # Stateless session token: an HMAC of the password, so a sign-in survives
+    # a Studio restart and changing the password signs every browser out.
+    token = (hmac.new(password.encode("utf-8"), b"rtvio-studio-session", hashlib.sha256).hexdigest()
+             if password else None)
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, fmt, *args):
             pass
+
+        # --------------------------------------------------------- CORS --
+        # The UI may be served from elsewhere (Vercel - see deploy/vercel/)
+        # and call this API cross-origin. Only the origins given by
+        # --cors-origin may; every response passes through end_headers, so
+        # this one hook covers JSON, files, MJPEG and the /viz/ proxy.
+
+        def _cors_origin(self):
+            o = self.headers.get("Origin")
+            return o if o and any(fnmatch.fnmatchcase(o, pat) for pat in cors_origins) else None
+
+        def end_headers(self):
+            o = self._cors_origin()
+            if o:
+                self.send_header("Access-Control-Allow-Origin", o)
+                self.send_header("Vary", "Origin")
+            super().end_headers()
+
+        def do_OPTIONS(self):
+            if not self._cors_origin():
+                return self._send(403, {"error": "origin not allowed"})
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        # --------------------------------------------------------- auth --
+        # Three ways to present the token: the cookie /login sets (UI served
+        # by this server), an Authorization: Bearer header (UI served from
+        # elsewhere - fetch/XHR), or ?token= (what that remote UI puts on
+        # <img>/<iframe>/download URLs, which cannot carry a header).
+
+        def _authorized(self):
+            if token is None:
+                return True
+            given = None
+            auth = self.headers.get("Authorization") or ""
+            if auth.startswith("Bearer "):
+                given = auth[len("Bearer "):].strip()
+            if given is None:
+                given = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                         .get("token", [None])[0])
+            if given is None:
+                try:
+                    m = http.cookies.SimpleCookie(self.headers.get("Cookie") or "").get(AUTH_COOKIE)
+                except http.cookies.CookieError:
+                    m = None
+                given = m.value if m is not None else None
+            return given is not None and hmac.compare_digest(given.encode("utf-8"), token.encode("utf-8"))
+
+        def _api_login(self):
+            """JSON sign-in for a UI served from another origin: returns the
+            token for it to keep and send as Authorization: Bearer."""
+            given = str(self._json_body().get("password") or "")
+            if token is None:
+                return self._send(200, {"ok": True, "token": ""})
+            if not hmac.compare_digest(given.encode("utf-8"), password.encode("utf-8")):
+                time.sleep(1.0)                      # slows password guessing
+                return self._send(401, {"ok": False, "error": "wrong password"})
+            return self._send(200, {"ok": True, "token": token})
+
+        def _reject(self, path):
+            # Any request body is left unread, so this connection cannot be
+            # reused for another request.
+            self.close_connection = True
+            if path.startswith(("/api/", "/files/", "/video_files/", "/viz/")):
+                return self._send(401, {"error": "sign in required"}, extra={"Connection": "close"})
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def _login_page(self, code=200, error=""):
+            return self._send(code, LOGIN_PAGE.replace("__ERROR__", error), "text/html; charset=utf-8")
+
+        def _login(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            form = urllib.parse.parse_qs(self.rfile.read(min(n, 4096)).decode("utf-8", "replace")) if n else {}
+            given = (form.get("password") or [""])[0]
+            if token is None or not hmac.compare_digest(given.encode("utf-8"), password.encode("utf-8")):
+                time.sleep(1.0)                      # slows password guessing
+                return self._login_page(401, "Wrong password")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
+                             % (AUTH_COOKIE, token, 30 * 86400))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         # ------------------------------------------------------ helpers --
 
@@ -498,6 +622,144 @@ def make_handler(studio):
                 return self._send(400, {"ok": False, "error": res})
             return self._send(200, {"ok": True, "session": res})
 
+        # ----------------------------------------------- chunked uploads --
+        # A file is sent as a series of POST /api/uploads/<id>?offset=N
+        # chunks, then handed to /api/upload-video or /api/sessions/import
+        # with ?upload=<id>. Chunked because Cloudflare (the tunnel that puts
+        # this server behind the Vercel-hosted UI) rejects any request body
+        # over 100 MB, and because a dropped mobile connection then costs
+        # one chunk, not the whole take: the browser retries from the size
+        # the server reports.
+
+        def _incoming(self, uid):
+            if not UPLOAD_ID_RE.match(uid or ""):
+                return None
+            return os.path.join(studio.upload_root, ".incoming", uid + ".part")
+
+        def _upload_start(self):
+            d = os.path.join(studio.upload_root, ".incoming")
+            os.makedirs(d, exist_ok=True)
+            for fn in os.listdir(d):                  # abandoned uploads
+                p = os.path.join(d, fn)
+                try:
+                    if time.time() - os.path.getmtime(p) > 24 * 3600:
+                        os.remove(p)
+                except OSError:
+                    pass
+            uid = os.urandom(16).hex()
+            open(os.path.join(d, uid + ".part"), "wb").close()
+            return self._send(200, {"ok": True, "id": uid})
+
+        def _upload_chunk(self, uid, offset):
+            p = self._incoming(uid)
+            n = int(self.headers.get("Content-Length") or 0)
+            if p is None or not os.path.exists(p):
+                self.close_connection = True
+                return self._send(404, {"ok": False, "error": "no such upload"}, extra={"Connection": "close"})
+            size = os.path.getsize(p)
+            if offset != size or n > MAX_CHUNK_BYTES:
+                # Out of step (e.g. a retried chunk that did land): the
+                # browser resumes from "size".
+                self.close_connection = True
+                return self._send(409, {"ok": False, "error": "offset mismatch", "size": size},
+                                  extra={"Connection": "close"})
+            remaining = n
+            with open(p, "ab") as f:
+                while remaining:
+                    chunk = self.rfile.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            if remaining:
+                self.close_connection = True
+                with open(p, "r+b") as f:             # drop the partial chunk
+                    f.truncate(size)
+                return self._send(400, {"ok": False, "error": "chunk cut off", "size": size},
+                                  extra={"Connection": "close"})
+            return self._send(200, {"ok": True, "size": size + n})
+
+        def _upload_video(self, uid, name):
+            """Moves a finished chunked upload to
+            <data-root>/uploads/<timestamp>/<name> and queues it exactly
+            like /api/reconstruct-video. This is how a clip reaches the GPU
+            PC when the browser is not on it - a laptop, or a phone's
+            gallery or camera."""
+            p = self._incoming(uid)
+            if p is None or not os.path.exists(p):
+                return self._send(404, {"ok": False, "error": "no such upload"})
+            safe = re.sub(r"[^\w.-]", "_", os.path.basename(name or "").strip()) or "video.mp4"
+            if not os.path.getsize(p) or os.path.splitext(safe)[1].lower() not in VIDEO_EXTS:
+                return self._send(400, {"ok": False, "error": "expected a non-empty %s file"
+                                        % "/".join(VIDEO_EXTS)})
+            base = os.path.join(studio.upload_root, time.strftime("%Y%m%d-%H%M%S"))
+            d, k = base, 2
+            while os.path.exists(d):
+                d, k = "%s-%d" % (base, k), k + 1
+            os.makedirs(d)
+            dest = os.path.join(d, safe)
+            os.replace(p, dest)
+            job = studio.queue.submit_video(dest, dict(studio.settings["recon"]))
+            return self._send(200, {"ok": True, "job": job.id})
+
+        def _import_uploaded_session(self, uid, preferred_id):
+            p = self._incoming(uid)
+            if p is None or not os.path.exists(p):
+                return self._send(404, {"ok": False, "error": "no such upload"})
+            try:
+                ok, res = studio.import_session_zip(p, preferred_id)
+            finally:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            if not ok:
+                return self._send(400, {"ok": False, "error": res})
+            return self._send(200, {"ok": True, "session": res})
+
+        def _proxy_viz(self, rest):
+            """Relays /viz/<rest> to the running job's recon_viz server on
+            127.0.0.1 (jobs.py gives every job the same port), streaming the
+            body so its Server-Sent-Events feed passes through live. Keeps
+            the viewer behind this server's sign-in and on its one port,
+            instead of needing another port opened to remote browsers."""
+            port = studio.queue.viz_port
+            if not port:
+                return self._send(404, {"error": "live viewer disabled"})
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.connect()
+                # Kept here: for a response read until close (SSE),
+                # http.client hands the socket to the response and sets
+                # conn.sock to None.
+                sock = conn.sock
+                conn.request("GET", "/" + rest)
+                resp = conn.getresponse()
+            except OSError:
+                return self._send(502, {"error": "no live viewer running"})
+            try:
+                self.send_response(resp.status)
+                for k in ("Content-Type", "Content-Length", "Cache-Control"):
+                    v = resp.getheader(k)
+                    if v:
+                        self.send_header(k, v)
+                if resp.getheader("Content-Length") is None:
+                    # SSE: no length, runs until one side closes.
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                    sock.settimeout(None)            # windows can be minutes apart
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(1 << 16)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (ConnectionError, OSError):
+                self.close_connection = True
+            finally:
+                conn.close()
+
         @staticmethod
         def _inside(root, rel):
             p = os.path.realpath(os.path.join(root, rel))
@@ -509,6 +771,24 @@ def make_handler(studio):
         def do_GET(self):
             url = urllib.parse.urlparse(self.path)
             path = urllib.parse.unquote(url.path)
+            if path == "/login":
+                return self._login_page()
+            if path == "/api/health":
+                # Unauthenticated on purpose: the remote UI's "is the
+                # processing server on?" check, before anyone has signed in.
+                return self._send(200, {"ok": True, "service": "rtvio-studio",
+                                        "auth_required": token is not None,
+                                        "authed": self._authorized()})
+            if not self._authorized():
+                return self._reject(path)
+            if path == "/viz":
+                self.send_response(301)
+                self.send_header("Location", "/viz/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path.startswith("/viz/"):
+                return self._proxy_viz(url.path[len("/viz/"):])
             if path in ("/", "/index.html"):
                 return self._file(os.path.join(WEB_DIR, "index.html"))
             if path.startswith("/static/"):
@@ -589,11 +869,31 @@ def make_handler(studio):
         def do_POST(self):
             url = urllib.parse.urlparse(self.path)
             path = url.path
+            if path == "/login":
+                return self._login()
+            if path == "/api/login":
+                return self._api_login()
+            if not self._authorized():
+                return self._reject(path)
+            q = urllib.parse.parse_qs(url.query)
+            if path == "/api/uploads":
+                return self._upload_start()
+            m = re.match(r"^/api/uploads/([0-9a-f]{32})$", path)
+            if m:
+                try:
+                    offset = int(q.get("offset", ["0"])[0])
+                except ValueError:
+                    offset = -1
+                return self._upload_chunk(m.group(1), offset)
+            if path == "/api/upload-video":
+                return self._upload_video(q.get("upload", [None])[0], q.get("name", [None])[0])
             if path == "/api/sessions/import":
+                preferred = q.get("id", [None])[0]
+                if q.get("upload"):
+                    return self._import_uploaded_session(q["upload"][0], preferred)
                 # Body is raw zip bytes, not JSON - must not go through
                 # _json_body() below, which would consume the whole
                 # request off the socket trying (and failing) to decode it.
-                preferred = urllib.parse.parse_qs(url.query).get("id", [None])[0]
                 return self._import_session(preferred)
             body = self._json_body()
             if path == "/api/record/start":
@@ -644,11 +944,10 @@ def make_handler(studio):
                 job = studio.queue.submit(d, studio.recon_params(d, body.get("recon")))
                 return self._send(200, {"ok": True, "job": job.id})
             if path == "/api/reconstruct-video":
-                # No upload: this is a local desktop tool the browser UI just
-                # remote-controls (see the module docstring's "no
-                # authentication" note) - a path on this machine is exactly
-                # as trusted as the phone-capture and subprocess control the
-                # rest of this API already has.
+                # A path on the Studio PC (a browser elsewhere uses
+                # /api/upload-video instead). Behind the same sign-in as the
+                # phone-capture and subprocess control the rest of this API
+                # already has, so a path here is no more trusted than those.
                 # Windows Explorer's "Copy as path" wraps the path in quotes,
                 # so strip them rather than looking for a file whose name
                 # starts with a double quote.
@@ -681,8 +980,13 @@ def make_handler(studio):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--web-host", default="127.0.0.1",
-                    help="interface for the web UI (default: this PC only; 0.0.0.0 exposes "
-                         "the unauthenticated control page to the whole LAN)")
+                    help="interface for the web UI (default: this PC only; 0.0.0.0 serves it "
+                         "on every interface - LAN, Tailscale - and then needs a password)")
+    ap.add_argument("--password", default=os.environ.get("RTVIO_STUDIO_PASSWORD") or None,
+                    help="sign-in password for the web UI (default: $RTVIO_STUDIO_PASSWORD, "
+                         "preferred - a command line is visible to other processes)")
+    ap.add_argument("--no-auth", action="store_true",
+                    help="serve a non-localhost --web-host without a password (trusted network only)")
     ap.add_argument("--port", type=int, default=8080, help="web UI port")
     ap.add_argument("--phone-host", default="0.0.0.0")
     ap.add_argument("--phone-port", type=int, default=5555, help="port the app connects to")
@@ -692,14 +996,34 @@ def main():
     ap.add_argument("--recon-viz-port", type=int, default=8767,
                     help="port for each reconstruction's live viewer (--live-viz) - always the same "
                          "port since jobs.py runs one reconstruction at a time")
+    ap.add_argument("--cors-origin", action="append",
+                    default=[o.strip() for o in (os.environ.get("RTVIO_STUDIO_CORS_ORIGINS") or "").split(",")
+                             if o.strip()],
+                    help="origin of a web UI hosted elsewhere that may call this API, e.g. "
+                         "https://rtvio.vercel.app (repeatable; fnmatch wildcards allowed; default: "
+                         "$RTVIO_STUDIO_CORS_ORIGINS, comma-separated). Requires a password.")
     ap.add_argument("--open", action="store_true", help="open the page in a browser")
     args = ap.parse_args()
+    if args.web_host not in ("127.0.0.1", "localhost", "::1") and not args.password and not args.no_auth:
+        ap.error("--web-host %s exposes the control page beyond this PC: set a password "
+                 "(RTVIO_STUDIO_PASSWORD or --password), or pass --no-auth" % args.web_host)
+    # A tunnel (cloudflared) reaches a 127.0.0.1 server too, so --web-host
+    # alone cannot tell the server is public; a remote UI origin can.
+    if args.cors_origin and not args.password:
+        ap.error("--cors-origin means this API is used from the internet: set a password "
+                 "(RTVIO_STUDIO_PASSWORD or --password)")
 
     studio = Studio(args.data_root, args.phone_host, args.phone_port, viz_port=args.recon_viz_port)
-    httpd = ThreadingHTTPServer((args.web_host, args.port), make_handler(studio))
+    httpd = ThreadingHTTPServer((args.web_host, args.port),
+                                make_handler(studio, args.password, tuple(args.cors_origin)))
     httpd.daemon_threads = True
     url = "http://%s:%d" % ("127.0.0.1" if args.web_host in ("0.0.0.0", "") else args.web_host, args.port)
-    print("RTVIO Studio: %s" % url)
+    print("RTVIO Studio: %s%s" % (url, "  (password sign-in)" if args.password else ""))
+    for o in args.cors_origin:
+        print("  remote UI allowed from: %s" % o)
+    if args.web_host in ("0.0.0.0", ""):
+        for a in studio.lan:
+            print("  remote: http://%s:%d%s" % (a, args.port, "  (Tailscale)" if a.startswith("100.") else ""))
     print("phone: set Server IP to one of %s, port %d" % (", ".join(studio.lan) or "<this PC's LAN IP>",
                                                           args.phone_port))
     drone_ip = studio.settings["drone"].get("ip")

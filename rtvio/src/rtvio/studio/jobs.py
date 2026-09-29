@@ -183,7 +183,9 @@ class ReconJob:
             "id": self.id, "kind": self.kind, "session": self.session_id, "label": self.label,
             "state": self.state, "params": self.params,
             "out_dir": os.path.basename(self.out_dir) if self.out_dir else None,
-            "viz_url": ("http://127.0.0.1:%d" % self.viz_port) if self.state == "running" and self.viz_port else None,
+            # Relative: server.py proxies /viz/ to the job's viewer, so the
+            # link works from any machine that can reach the Studio page.
+            "viz_url": "/viz/" if self.state == "running" and self.viz_port else None,
             "created": self.created, "started": self.started, "finished": self.finished,
             "elapsed_s": round((self.finished or time.time()) - self.started, 1) if self.started else None,
             "returncode": self.returncode, "error": self.error,

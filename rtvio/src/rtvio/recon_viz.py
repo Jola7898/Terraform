@@ -226,7 +226,7 @@ function renderReport(r){
 
 function loadFinal(){
   const loader = new THREE.PLYLoader();
-  loader.load('/mesh.ply', (g) => {
+  loader.load('mesh.ply' + location.search, (g) => {
     g.computeVertexNormals();
     scene.remove(current);
     const hasColor = !!g.getAttribute('color');
@@ -240,7 +240,7 @@ function loadFinal(){
     frameCamera(current);
   }, undefined, () => {
     // no mesh (meshing skipped/failed) - fall back to the finished cloud
-    loader.load('/cloud.ply', (g) => {
+    loader.load('cloud.ply' + location.search, (g) => {
       scene.remove(current);
       current = new THREE.Points(g, new THREE.PointsMaterial({size:0.035, vertexColors: !!g.getAttribute('color')}));
       scene.add(current);
@@ -252,7 +252,7 @@ function loadFinal(){
 
 // ---- SSE
 const statusEl = document.getElementById('status');
-const es = new EventSource('/events');
+const es = new EventSource('events' + location.search);
 es.onopen = () => { statusEl.textContent = 'live'; statusEl.className = 'live'; };
 es.onerror = () => { statusEl.textContent = 'reconnecting...'; statusEl.className = ''; };
 es.onmessage = (ev) => {
@@ -340,6 +340,7 @@ class ReconViz:
                     self.wfile.write(f.read())
 
             def do_GET(self):
+                self.path = self.path.split("?", 1)[0]    # the page forwards its query string
                 if self.path in ("/", "/index.html"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")

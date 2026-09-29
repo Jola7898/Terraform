@@ -616,6 +616,7 @@ SIH26158.pdf    the problem statement this project targets
 | How does the pipeline actually work, file by file? | [`rtvio/README.md`](rtvio/README.md) |
 | What changed and why (EKF removal, VGGT pivot, bug fixes)? | [`rtvio/CHANGELOG.md`](rtvio/CHANGELOG.md) |
 | Phone↔desktop wire protocol details, three-lane live architecture | [`rtvio/docs/STREAMING.md`](rtvio/docs/STREAMING.md) |
+| Host the website on Vercel and run the pipeline on your GPU PC from anywhere (Cloudflare Tunnel, offline detection, uploads; Tailscale for phone/drone) | [`rtvio/docs/REMOTE_ACCESS.md`](rtvio/docs/REMOTE_ACCESS.md) |
 | Camera intrinsics auto-discovery | [`rtvio/docs/CAMERA_INTRINSICS_INTEGRATION.md`](rtvio/docs/CAMERA_INTRINSICS_INTEGRATION.md) |
 | Android app internals, wire protocol, release signing | [`rtvioapk/README.md`](rtvioapk/README.md) |
 | Drone capture in RTVIO Studio: Indoor/Outdoor, session files, timestamps | [`rtvio/README.md` → Drone in RTVIO Studio](rtvio/README.md#drone-in-rtvio-studio) |
