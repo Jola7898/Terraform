@@ -613,7 +613,7 @@ def _integrate_window(raw, loader, masker, start, end, conf_percentile, edge_thr
             log("  WARNING: only %d confident shared pixels - fell back to single-camera chaining" % n_corr)
         if state.gps_guide is not None:
             dense = seam["method"] == "dense-sim3"
-            use_gps, s_gps, sig = state.gps_guide.check(idxs, C.double().cpu().numpy(), s, dense)
+            use_gps, s_gps, sig = state.gps_guide.check(idxs, C.double().cpu().numpy(), s, seam)
             seam.update(gps_scale=s_gps, gps_scale_sigma=sig)
             if use_gps:
                 log("  GPS scale %.4f (+-%.1f%%) replaces %s scale %.4f"

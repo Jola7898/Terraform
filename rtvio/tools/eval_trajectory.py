@@ -68,6 +68,34 @@ def _stats(e):
             "p90_m": float(np.percentile(e, 90)), "max_m": float(np.max(e))}
 
 
+def _absolute(e):
+    h, v, d3 = np.linalg.norm(e[:, :2], axis=1), np.abs(e[:, 2]), np.linalg.norm(e, axis=1)
+    return {"horizontal": _stats(h), "vertical": _stats(v), "3d": _stats(d3),
+            "within_1m_3d": float(np.mean(d3 <= 1.0)), "within_1m_horizontal": float(np.mean(h <= 1.0))}
+
+
+def _plot(path, title, gt, aligned, georef):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot(gt[:, 0], gt[:, 1], "k-", lw=2, label="RTK ground truth")
+    if georef is not None:
+        ax.plot(georef[:, 0], georef[:, 1], "r-", lw=1, label="reconstruction (as georeferenced)")
+    ax.plot(aligned[:, 0], aligned[:, 1], "b-", lw=1, label="reconstruction (best-fit Sim(3))")
+    ax.plot(gt[0, 0], gt[0, 1], "go", label="start")
+    ax.set_aspect("equal")
+    ax.set_xlabel("East (m)")
+    ax.set_ylabel("North (m)")
+    ax.set_title(title)
+    ax.legend()
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
 def evaluate(run_dir, session_dir):
     cams = json.load(open(os.path.join(run_dir, "cameras.json")))
     meta = json.load(open(os.path.join(session_dir, "session_meta.json")))
@@ -86,14 +114,17 @@ def evaluate(run_dir, session_dir):
     out = {"run": os.path.basename(os.path.normpath(run_dir)), "frames_scored": int(valid.sum()),
            "frames_total": len(t), "georeferenced": ref is not None, "gt_vertical_offset_applied_m": up_offset}
     if ref is not None:
-        e = est - gt
-        h, v = np.linalg.norm(e[:, :2], axis=1), np.abs(e[:, 2])
-        d3 = np.linalg.norm(e, axis=1)
-        out["absolute"] = {"horizontal": _stats(h), "vertical": _stats(v), "3d": _stats(d3),
-                           "within_1m_3d": float(np.mean(d3 <= 1.0)), "within_1m_horizontal": float(np.mean(h <= 1.0))}
+        out["absolute"] = _absolute(est - gt)
+        # The two receivers can disagree by a constant horizontal offset (HKairport_GNSS03: ~7.5 m, p90 spread
+        # 2.2 m) - a reference-frame difference no GPS-anchored pipeline can see. Scored both ways.
+        d = meta.get("datum") or {}
+        en = np.array([d.get("rtk_minus_gnss_east_m") or 0.0, d.get("rtk_minus_gnss_north_m") or 0.0, 0.0])
+        out["absolute_receiver_offset_removed"] = dict(_absolute(est - (gt - en)), offset_en_m=en[:2].tolist())
     s, R, tr = umeyama(est, gt)
-    ate = np.linalg.norm(s * est @ R.T + tr - gt, axis=1)
+    aligned = s * est @ R.T + tr
+    ate = np.linalg.norm(aligned - gt, axis=1)
     out["shape_sim3"] = {**_stats(ate), "scale": float(s)}
+    _plot(os.path.join(run_dir, "trajectory_vs_rtk.png"), out["run"], gt, aligned, est if ref is not None else None)
 
     rep_path = os.path.join(run_dir, "CHECKPOINT_REPORT.json")
     if os.path.exists(rep_path):
@@ -106,14 +137,16 @@ def evaluate(run_dir, session_dir):
 
 
 def table(results):
-    head = ("| run | georef | horiz median / p90 (m) | vert median (m) | <=1 m (3D) | shape ATE rmse (m) "
-            "| fps | peak VRAM (GB) | fallback / GPS-scaled seams |")
-    lines = [head, "|" + "---|" * 9]
+    head = ("| run | georef | horiz median / p90 (m) | horiz median, receiver offset removed (m) | vert median (m) "
+            "| <=1 m (3D) | shape ATE rmse (m) | fps | peak VRAM (GB) | fallback / GPS-scaled seams |")
+    lines = [head, "|" + "---|" * 10]
     for r in results:
         a, st = r.get("absolute"), r.get("run_stats") or {}
-        lines.append("| %s | %s | %s | %s | %s | %.2f | %s | %s | %s / %s |" % (
+        ao = r.get("absolute_receiver_offset_removed")
+        lines.append("| %s | %s | %s | %s | %s | %s | %.2f | %s | %s | %s / %s |" % (
             r["run"], "yes" if r["georeferenced"] else "no",
             "%.2f / %.2f" % (a["horizontal"]["median_m"], a["horizontal"]["p90_m"]) if a else "-",
+            "%.2f" % ao["horizontal"]["median_m"] if ao else "-",
             "%.2f" % a["vertical"]["median_m"] if a else "-",
             "%.0f%%" % (100 * a["within_1m_3d"]) if a else "-",
             r["shape_sim3"]["rmse_m"],
