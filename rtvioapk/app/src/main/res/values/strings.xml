@@ -104,7 +104,11 @@
     <string name="pref_server_ip">Server IP address</string>
     <string name="pref_server_ip_summary">IP of the desktop receiver on this network, or the public https address of the Studio to stream from anywhere</string>
     <string name="pref_server_password">Studio password</string>
-    <string name="pref_server_password_summary">Only needed for an https:// server address</string>
+    <string name="pref_server_password_summary">The Studio\'s sign-in password. Needed for an https:// address and for Studio mode over Tailscale</string>
+    <string name="pref_studio_port">Studio web port</string>
+    <string name="pref_studio_port_summary">Port of the Studio website on the PC (default 8080). Used when Tailscale is on and the Studio answers at the Server IP</string>
+    <string name="pref_auto_studio">Auto-connect in Studio mode</string>
+    <string name="pref_auto_studio_summary">When Tailscale is on and the Studio answers, connect the phone to it automatically</string>
     <string name="pref_server_port">Server port</string>
     <string name="pref_discover">Find receivers on this network</string>
     <string name="pref_discover_summary">Browses for _rtvio._tcp services via mDNS</string>
@@ -144,6 +148,32 @@
 
     <string name="pref_bandwidth_title">Estimated uplink required</string>
     <string name="bandwidth_estimate">Estimated uplink: %1$s Mbps</string>
+
+    <!-- Studio mode (Tailscale) -->
+    <string name="studio_title">RTVIO Studio</string>
+    <string name="studio_via_tailscale">via Tailscale</string>
+    <string name="studio_state_online">online — tap CONNECT</string>
+    <string name="studio_state_connecting">connecting…</string>
+    <string name="studio_state_ready">phone connected · ready</string>
+    <string name="studio_state_recording">recording</string>
+    <string name="studio_state_uploading">uploading frames</string>
+    <string name="studio_live">Live reconstruct</string>
+    <string name="studio_enhance">Enhance image quality</string>
+    <string name="studio_open">Open Studio</string>
+    <string name="studio_open_result">View result</string>
+    <string name="studio_camera">Camera</string>
+    <string name="studio_reload">Reload</string>
+    <string name="studio_unreachable">Can\'t reach the Studio. Check that Tailscale is on and the Studio is running on the PC.</string>
+    <string name="studio_result_recording">Recording… frames are going straight to the Studio</string>
+    <string name="studio_result_recording_live">Recording · live reconstruction is running on the PC</string>
+    <string name="studio_result_saved">Take saved · waiting for the reconstruction to start</string>
+    <string name="studio_result_working">Reconstructing · %1$s</string>
+    <string name="studio_result_done">Reconstruction done</string>
+    <string name="studio_result_failed">Reconstruction failed: %1$s</string>
+    <string name="studio_result_cancelled">Reconstruction cancelled</string>
+    <string name="studio_mobile_data">On mobile data: about %1$.0f MB per minute while recording. Lower the resolution, frame rate or quality in Settings to use less.</string>
+    <string name="studio_download_started">Download started — see your notifications</string>
+    <string name="studio_no_tailscale_hint">Tailscale is off — turn it on to use the Studio from anywhere</string>
 
     <!-- Specs screen -->
     <string name="cd_preview">Camera preview</string>

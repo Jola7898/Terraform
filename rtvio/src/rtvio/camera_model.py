@@ -68,7 +68,23 @@ def matrices(p):
 
 
 def has_distortion(p):
-    return bool(np.any(np.abs(matrices(p)[1]) > 1e-9))
+    # A fisheye profile always needs remapping, even with all-zero k1..k4:
+    # that is the ideal equidistant lens (r = f * theta), not a pinhole.
+    return p["model"] == "fisheye" or bool(np.any(np.abs(matrices(p)[1]) > 1e-9))
+
+
+def fisheye_from_fov(width, height, hfov_deg):
+    """An assumed profile for an uncalibrated fisheye lens known only by its
+    horizontal field of view (e.g. a drone spec sheet's 124 degrees): ideal
+    equidistant projection r = f * theta, square pixels, principal point at
+    the image centre. Not a substitute for a checkerboard calibration - real
+    lenses deviate from equidistant - but it removes most of the bowing."""
+    if not 0 < hfov_deg < 360:
+        raise ValueError("horizontal field of view must be between 0 and 360 degrees")
+    f = (width / 2.0) / math.radians(hfov_deg / 2.0)
+    return normalize({"model": "fisheye", "width": int(width), "height": int(height),
+                      "fx": f, "fy": f, "cx": (width - 1) / 2.0, "cy": (height - 1) / 2.0,
+                      "source": "assumed equidistant fisheye, %.0f deg horizontal FOV" % hfov_deg})
 
 
 def scaled(p, width, height):

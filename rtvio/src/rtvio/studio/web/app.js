@@ -408,9 +408,10 @@ function renderGpu(g) {
     const x = (i / (s.length - 1)) * c.width, y = c.height - (p.util / 100) * (c.height - 2) - 1;
     i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
   });
-  ctx.strokeStyle = "#4cc2ff"; ctx.lineWidth = 1.5; ctx.stroke();
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#7aa7e8";
+  ctx.strokeStyle = accent; ctx.lineWidth = 1.5; ctx.stroke();
   ctx.lineTo(c.width, c.height); ctx.lineTo(0, c.height); ctx.closePath();
-  ctx.fillStyle = "rgba(76,194,255,.15)"; ctx.fill();
+  ctx.globalAlpha = 0.15; ctx.fillStyle = accent; ctx.fill(); ctx.globalAlpha = 1;
 }
 
 /* ------------------------------------------------------------ sessions */
@@ -645,14 +646,25 @@ async function uploadVideo(ev) {
   status.textContent = `uploading ${name}…`;
   try {
     const id = await uploadChunked(file, status, name);
-    await api("POST", `/api/upload-video?upload=${id}&name=${encodeURIComponent(name)}`);
-    status.textContent = `${name} uploaded - reconstruction queued`;
+    let fisheye = "";
+    if ($("videoFisheye").checked) {
+      fisheye = `&fisheye=1&hfov=${encodeURIComponent($("videoHfov").value || 124)}&vfov=${encodeURIComponent($("videoVfov").value || 60)}`;
+    }
+    const opts = [$("videoFisheye").checked && "fisheye corrected", $("videoEnhance").checked && "enhanced",
+                  $("videoFast").checked && "fast & clean"].filter(Boolean);
+    if ($("videoEnhance").checked) fisheye += "&enhance=1";
+    if ($("videoFast").checked) fisheye += "&fast=1";
+    const isZip = /\.zip$/i.test(name);
+    if (isZip) status.textContent = `unpacking ${name}…`;
+    await api("POST", `/api/upload-video?upload=${id}&name=${encodeURIComponent(name)}${fisheye}`);
+    status.textContent = `${name} uploaded - reconstruction queued${opts.length ? " (" + opts.join(", ") + ")" : ""}`;
     pollVideoJobs();
   } catch (e) {
     status.textContent = "";
     alert("Upload failed: " + e.message);
   }
 }
+$("videoFisheye").addEventListener("change", (ev) => { $("videoFisheyeFov").hidden = !ev.target.checked; });
 $("videoUploadFile").addEventListener("change", uploadVideo);
 $("videoCaptureFile").addEventListener("change", uploadVideo);
 
@@ -699,7 +711,20 @@ async function pollVideoJobs() {
 }
 async function pollSessions() {
   if (!READY) return;
-  try { SESSIONS = await api("GET", "/api/sessions"); renderSessions(); } catch (e) { /* next tick */ }
+  try { SESSIONS = await api("GET", "/api/sessions"); renderSessions(); openDeepLink(); } catch (e) { /* next tick */ }
+}
+
+// #/studio/view/<session id> opens that session's newest result in the viewer - what the phone
+// app's "View result" button (and its automatic open when a reconstruction finishes) points at.
+function openDeepLink() {
+  const m = location.hash.match(/^#\/studio\/view\/([\w.-]+)/);
+  if (!m) return;
+  const s = SESSIONS.find((x) => x.id === m[1]);
+  const rec = s && s.recons[s.recons.length - 1];
+  if (!rec || !(rec.files["mesh_poisson.ply"] || rec.files["cloud_raw.ply"])) return;
+  history.replaceState(null, "", "#/studio"); // consume the link (no history entry) so it opens once
+  openViewer(`/files/${encodeURIComponent(s.id)}/${rec.name}/`, `${s.id} / ${rec.name}`,
+    rec.files["mesh_poisson.ply"] ? "mesh" : "cloud");
 }
 
 /* ---------------------------------------------------------------- gate */
@@ -775,6 +800,65 @@ setInterval(pollVideoJobs, 2500);
 const V = { renderer: null, scene: null, camera: null, controls: null, obj: null, cams: null,
   sid: null, rec: null, kind: null, radius: 1, center: new THREE.Vector3() };
 
+function applyViewerTheme() {
+  // The output viewer stays dark even though the rest of the Studio is light.
+  if (V.scene) V.scene.background = new THREE.Color(0x07090c);
+}
+window.addEventListener("themechange", applyViewerTheme);
+
+
+// Free rotation: dragging with the left button turns the MODEL about the screen's own axes, so it
+// can go over the top and all the way round in any direction (OrbitControls stops at the poles).
+// Right-drag / Shift-drag still pans and the wheel still zooms - those stay with OrbitControls.
+function attachFreeRotate(el, camera, getObj, onChange, onEnd, isActive) {
+  const pts = new Map();                       // active pointers: id -> {x, y}
+  let mode = "tumble";                         // "tumble" (left-drag) or "roll" (Alt-drag)
+  let lastTwist = null;
+  const axis = (x, y, z) => new THREE.Vector3(x, y, z).applyQuaternion(camera.quaternion);
+  const turn = (a, angle) => getObj().quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(a, angle));
+  const k = () => (Math.PI * 2) / Math.max(el.clientHeight, 320);       // about one full turn per view height
+  el.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;                          // right / middle: OrbitControls pans, zooms
+    if (e.pointerType === "mouse" && (e.shiftKey || e.ctrlKey || e.metaKey)) return;  // Shift / Ctrl + drag: OrbitControls pans
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+    mode = e.altKey ? "roll" : "tumble";
+    lastTwist = null;
+  });
+  el.addEventListener("pointermove", (e) => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    if (e.pointerType === "mouse" && e.buttons === 0) { pts.clear(); onEnd(); return; }   // the release was missed: do not stay stuck
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size >= 2) {                                        // two fingers: a twist rolls the model
+      const [a, b] = [...pts.values()];
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      if (lastTwist !== null) {
+        let d = ang - lastTwist;
+        if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;
+        turn(axis(0, 0, -1), d);
+        onChange();
+      }
+      lastTwist = ang;
+      return;
+    }
+    if (mode === "roll") turn(axis(0, 0, -1), dx * k());        // Alt-drag: turn about the line of sight
+    else { turn(axis(0, 1, 0), dx * k()); turn(axis(1, 0, 0), dy * k()); }   // drag: tumble about the screen's own axes
+    onChange();
+  });
+  const end = (e) => { if (pts.delete(e.pointerId)) { lastTwist = null; if (!pts.size) onEnd(); } };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+  el.addEventListener("lostpointercapture", end);
+  // Q / E roll from the keyboard (not while typing in a field)
+  window.addEventListener("keydown", (e) => {
+    if ((isActive && !isActive()) || /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || "")) return;
+    if (e.key === "q" || e.key === "Q") { turn(axis(0, 0, -1), 0.08); onChange(); onEnd(); }
+    else if (e.key === "e" || e.key === "E") { turn(axis(0, 0, -1), -0.08); onChange(); onEnd(); }
+  });
+}
+
 function initViewer() {
   if (V.renderer) return;
   const host = $("viewerCanvas");
@@ -782,11 +866,18 @@ function initViewer() {
   V.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   host.appendChild(V.renderer.domElement);
   V.scene = new THREE.Scene();
-  V.scene.background = new THREE.Color(0x07090c);
+  applyViewerTheme();
   V.camera = new THREE.PerspectiveCamera(55, 1, 0.001, 1e5);
   V.controls = new THREE.OrbitControls(V.camera, V.renderer.domElement);
   V.controls.enableDamping = true;
+  V.controls.enableRotate = false;      // left-drag rotates the model freely instead: see attachFreeRotate
+  attachFreeRotate(V.renderer.domElement, V.camera, () => V.group, syncRotSliders, saveRot,
+    () => !$("viewer").classList.contains("hidden"));
   V.controls.screenSpacePanning = true;
+  // The model (cloud/mesh + camera path) lives in V.group so the rotation
+  // sliders turn all of it about the model's centre.
+  V.group = new THREE.Group();
+  V.scene.add(V.group);
   V.scene.add(new THREE.HemisphereLight(0xffffff, 0x303040, 0.9));
   const sun = new THREE.DirectionalLight(0xffffff, 0.6);
   sun.position.set(1, 2, 1.5);
@@ -803,7 +894,7 @@ function initViewer() {
 function clearObj() {
   [V.obj, V.cams].forEach((o) => {
     if (!o) return;
-    V.scene.remove(o);
+    V.group.remove(o);
     o.traverse((c) => { if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); });
   });
   V.obj = V.cams = null;
@@ -827,31 +918,41 @@ async function loadCams(base) {
     const g = new THREE.BufferGeometry().setFromPoints(pts);
     V.cams = new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xffb020 }));
     V.cams.visible = $("showCams").checked;
-    V.scene.add(V.cams);
+    V.cams.position.copy(V.center).negate();
+    V.group.add(V.cams);
   } catch (e) { /* optional */ }
 }
 
 function openViewer(base, title, kind) {
   initViewer();
+  if (!viewerPushed) { history.pushState({ rtvioViewer: true }, ""); viewerPushed = true; }
+  applyRot();
   $("viewer").classList.remove("hidden");
   V.resize();
-  V.base = base; V.title = title;
+  V.base = base; V.title = title; V.full = false; V.noPreview = false;
   showKind(kind);
 }
 
 function showKind(kind) {
   V.kind = kind;
   document.querySelectorAll("#viewerKind button").forEach((b) => b.classList.toggle("on", b.dataset.kind === kind));
-  const file = kind === "mesh" ? "mesh_poisson.ply" : "cloud_raw.ply";
+  // A mesh opens as the small preview first (mesh_preview.ply, ~4 MB instead of up to ~270 MB) and
+  // falls back to the full one for runs that have no preview; "Full detail" loads the full mesh.
+  const wantPreview = kind === "mesh" && !V.full;
+  const file = kind === "mesh" ? (wantPreview ? "mesh_preview.ply" : "mesh_poisson.ply") : "cloud_raw.ply";
   const base = V.base;
   $("viewerTitle").textContent = `${V.title} / ${file}`;
-  $("viewerDownload").href = u(base + file);
-  $("viewerDownload").setAttribute("download", file);
+  // Download always gives the full-resolution file, even while a preview is on screen.
+  const dlFile = kind === "mesh" ? "mesh_poisson.ply" : "cloud_raw.ply";
+  $("viewerDownload").href = u(base + dlFile);
+  $("viewerDownload").setAttribute("download", dlFile);
   $("viewerLoading").classList.remove("hidden");
   $("viewerLoading").textContent = "loading " + file + "…";
   clearObj();
   new THREE.PLYLoader().load(u(base + file), (geom) => {
     $("viewerLoading").classList.add("hidden");
+    // "Full detail" is offered only while looking at a preview
+    $("viewerFull").classList.toggle("hidden", !(kind === "mesh" && file === "mesh_preview.ply"));
     geom.computeBoundingSphere();
     V.radius = Math.max(geom.boundingSphere.radius, 1e-6);
     V.center.copy(geom.boundingSphere.center);
@@ -870,20 +971,66 @@ function showKind(kind) {
       V.obj = new THREE.Points(geom, mat);
       $("viewerInfo").textContent = `${geom.getAttribute("position").count.toLocaleString()} points`;
     }
-    V.scene.add(V.obj);
+    V.obj.position.copy(V.center).negate();
+    V.group.position.copy(V.center);
+    V.group.add(V.obj);
     resetView();
     loadCams(base);
   }, (xhr) => {
     if (xhr.total) $("viewerLoading").textContent = `loading ${file}… ${(100 * xhr.loaded / xhr.total).toFixed(0)}%`;
   }, (err) => {
+    if (wantPreview) { V.full = true; V.noPreview = true; showKind(kind); return; }   // no preview for this run
     $("viewerLoading").textContent = "failed to load " + file;
     console.error(err);
   });
 }
 
+// Rotation, 0-360 deg per axis. Remembered (same key as the live viewer, which
+// is served from this origin) because a model that comes out upside down does
+// so for every run.
+const ROT = { x: $("rotX"), y: $("rotY"), z: $("rotZ") };
+// After a free drag the sliders show where the model ended up (and the orientation is remembered).
+function syncRotSliders() {
+  const e = new THREE.Euler().setFromQuaternion(V.group.quaternion, "YXZ");
+  const deg = (r) => Math.round(((THREE.MathUtils.radToDeg(r) % 360) + 360) % 360);
+  ROT.x.value = deg(e.x); ROT.y.value = deg(e.y); ROT.z.value = deg(e.z);
+}
+function saveRot() {
+  try { localStorage.setItem("rtvioRot2", JSON.stringify([ROT.x.value, ROT.y.value, ROT.z.value])); } catch (err) { /* private mode */ }
+}
+function applyRot() {
+  initViewer();
+  const r = (el) => THREE.MathUtils.degToRad(+el.value);
+  V.group.rotation.set(r(ROT.x), r(ROT.y), r(ROT.z), "YXZ");
+  try { localStorage.setItem("rtvioRot2", JSON.stringify([ROT.x.value, ROT.y.value, ROT.z.value])); } catch (e) { /* private mode */ }
+}
+// Default is flipped 180 deg about X: reconstructions come out upside down.
+const DEFAULT_ROT = [180, 0, 0];
+[ROT.x.value, ROT.y.value, ROT.z.value] = DEFAULT_ROT;
+try {
+  const saved = JSON.parse(localStorage.getItem("rtvioRot2") || "null");
+  if (saved) { ROT.x.value = saved[0]; ROT.y.value = saved[1]; ROT.z.value = saved[2]; }
+} catch (e) { /* ignore */ }
+Object.values(ROT).forEach((el) => el.addEventListener("input", applyRot));
+$("viewerFlip").addEventListener("click", () => { ROT.x.value = (+ROT.x.value + 180) % 360; applyRot(); });
+$("viewerRotReset").addEventListener("click", () => { [ROT.x.value, ROT.y.value, ROT.z.value] = DEFAULT_ROT; applyRot(); });
+
 document.querySelectorAll("#viewerKind button").forEach((b) => b.addEventListener("click", () => showKind(b.dataset.kind)));
-$("viewerClose").addEventListener("click", () => { $("viewer").classList.add("hidden"); clearObj(); });
+// The viewer takes one history entry while it is open, so the browser's (or the phone's) Back
+// closes it and leaves you in the Studio - without it, Back skipped straight past the Studio.
+let viewerPushed = false;
+function closeViewer(fromPop) {
+  $("viewer").classList.add("hidden");
+  clearObj();
+  if (viewerPushed) {
+    viewerPushed = false;
+    if (!fromPop) history.back();
+  }
+}
+window.addEventListener("popstate", () => { if (viewerPushed) closeViewer(true); });
+$("viewerClose").addEventListener("click", () => closeViewer(false));
 $("viewerReset").addEventListener("click", resetView);
+$("viewerFull").addEventListener("click", () => { V.full = true; showKind("mesh"); });
 $("ptSize").addEventListener("input", () => { if (V.obj && V.obj.isPoints) V.obj.material.size = parseFloat($("ptSize").value); });
 $("litMesh").addEventListener("change", () => { if (V.kind === "mesh") showKind("mesh"); });
 $("wireMesh").addEventListener("change", () => { if (V.obj && V.obj.material) V.obj.material.wireframe = $("wireMesh").checked; });

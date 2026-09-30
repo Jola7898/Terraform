@@ -34,8 +34,13 @@ class SettingsManager(context: Context) {
         const val KEY_SHOW_STATS = "show_stats"
         const val KEY_KEEP_AWAKE = "keep_awake"
         const val KEY_HAPTICS = "haptics"
+        const val KEY_STUDIO_PORT = "studio_port"
+        const val KEY_AUTO_STUDIO = "auto_studio"
+        const val KEY_STUDIO_LIVE = "studio_live"
+        const val KEY_STUDIO_ENHANCE = "studio_enhance"
 
         const val DEFAULT_PORT = 5555
+        const val DEFAULT_STUDIO_PORT = 8080
         /** Video frames buffered before the oldest is dropped (spec section 10.1). */
         const val VIDEO_QUEUE_CAPACITY = 10
     }
@@ -44,7 +49,24 @@ class SettingsManager(context: Context) {
         get() = prefs.getString(KEY_SERVER_IP, "").orEmpty().trim()
         set(value) = prefs.edit().putString(KEY_SERVER_IP, value.trim()).apply()
 
-    /** Studio password, only used when [serverIp] is an https:// address. */
+    /** Port of the Studio website/API (python -m rtvio.studio --port), used in Studio mode. */
+    var studioPort: Int
+        get() = (prefs.getString(KEY_STUDIO_PORT, DEFAULT_STUDIO_PORT.toString())?.toIntOrNull()
+            ?: DEFAULT_STUDIO_PORT).coerceIn(1, 65535)
+        set(value) = prefs.edit().putString(KEY_STUDIO_PORT, value.coerceIn(1, 65535).toString()).apply()
+
+    /** In Studio mode, connect to the Studio by itself instead of waiting for CONNECT. */
+    val autoStudio: Boolean get() = prefs.getBoolean(KEY_AUTO_STUDIO, true)
+
+    /** The two checkboxes on the Studio card, remembered between launches. */
+    var studioLive: Boolean
+        get() = prefs.getBoolean(KEY_STUDIO_LIVE, false)
+        set(value) = prefs.edit().putBoolean(KEY_STUDIO_LIVE, value).apply()
+    var studioEnhance: Boolean
+        get() = prefs.getBoolean(KEY_STUDIO_ENHANCE, false)
+        set(value) = prefs.edit().putBoolean(KEY_STUDIO_ENHANCE, value).apply()
+
+    /** Studio password: needed for https:// addresses and for Studio mode's API calls. */
     var serverPassword: String
         get() = prefs.getString(KEY_SERVER_PASSWORD, "").orEmpty()
         set(value) = prefs.edit().putString(KEY_SERVER_PASSWORD, value).apply()

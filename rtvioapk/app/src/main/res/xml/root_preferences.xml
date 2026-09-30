@@ -25,6 +25,20 @@
             android:dialogTitle="@string/pref_server_port"
             app:useSimpleSummaryProvider="true" />
 
+        <EditTextPreference
+            android:key="studio_port"
+            android:title="@string/pref_studio_port"
+            android:summary="@string/pref_studio_port_summary"
+            android:defaultValue="8080"
+            android:dialogTitle="@string/pref_studio_port"
+            app:useSimpleSummaryProvider="false" />
+
+        <SwitchPreferenceCompat
+            android:key="auto_studio"
+            android:title="@string/pref_auto_studio"
+            android:summary="@string/pref_auto_studio_summary"
+            android:defaultValue="true" />
+
         <Preference
             android:key="discover"
             android:title="@string/pref_discover"

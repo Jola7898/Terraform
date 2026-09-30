@@ -232,9 +232,13 @@ class StreamingSession(
 
         // Streaming over cellular to a LAN address cannot work, so this is a
         // hard stop rather than a warning.
-        // A tunnel (https:// address) works over any network, so the WiFi
-        // requirement only applies to a raw LAN connection.
-        if (!com.rtvio.mapper.net.Transport.isTunnel(host)) {
+        // A tunnel (https:// address) works over any network, and so does a
+        // tailnet address while Tailscale is on: its traffic is routed through
+        // the VPN over mobile data as well as WiFi. So the WiFi requirement
+        // only applies to a raw LAN connection.
+        val onTailnet = com.rtvio.mapper.net.Tailscale.isTailnetHost(host) &&
+            com.rtvio.mapper.net.Tailscale.isUp(appContext)
+        if (!com.rtvio.mapper.net.Transport.isTunnel(host) && !onTailnet) {
             registerWifiWatch()
             if (!isWifiConnected()) {
                 unregisterWifiWatch()

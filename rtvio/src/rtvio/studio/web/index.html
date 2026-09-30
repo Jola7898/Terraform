@@ -3,23 +3,79 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RTVIO Studio</title>
+<title>RTVIO · Real-time visual reconstruction</title>
+<script>document.documentElement.dataset.theme=/^#\/studio/.test(location.hash)?"light":"dark";</script>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header class="topbar">
-  <div class="brand">RTVIO <span>Studio</span></div>
-  <div id="dronePill" class="pill pill-off" data-source="drone" title="Show the drone">drone offline</div>
-  <div id="phonePill" class="pill pill-off" data-source="phone" title="Show the phone">phone disconnected</div>
-  <div class="gpu" title="GPU utilisation (nvidia-smi, 1 s samples)">
-    <canvas id="gpuSpark" width="160" height="28"></canvas>
-    <div class="gpu-text">
-      <div><b id="gpuUtil">–</b> GPU</div>
-      <div class="muted" id="gpuMem">–</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="logo" viewBox="0 0 24 24"><path d="M12 2.5 3.5 7v10L12 21.5 20.5 17V7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M3.5 7 12 11.5 20.5 7M12 11.5v10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></symbol>
+</svg>
+<header class="ribbon">
+  <a class="brand" href="#/home"><svg viewBox="0 0 24 24" style="color:var(--accent)" aria-hidden="true"><use href="#logo"/></svg>RTVIO <span>Studio</span></a>
+  <nav class="nav" aria-label="Main">
+    <a href="#/home" data-route="home">Home</a>
+    <a href="#/studio" data-route="studio">RTVIO Studio</a>
+  </nav>
+  <div class="ribbon-right">
+    <div class="studio-only">
+      <div id="dronePill" class="pill pill-off" data-source="drone" title="Show the drone">drone offline</div>
+      <div id="phonePill" class="pill pill-off" data-source="phone" title="Show the phone">phone disconnected</div>
+      <div class="gpu" title="GPU utilisation (nvidia-smi, 1 s samples)">
+        <canvas id="gpuSpark" width="160" height="28"></canvas>
+        <div class="gpu-text">
+          <div><b id="gpuUtil">–</b> GPU</div>
+          <div class="muted" id="gpuMem">–</div>
+        </div>
+      </div>
     </div>
   </div>
 </header>
+<canvas id="bgfx" aria-hidden="true"></canvas>
 
+
+<div id="viewStudio" class="hidden">
+<div class="page-title"><h1>RTVIO Studio</h1><span class="muted small">capture, reconstruct and explore</span></div>
+<section class="settings-panel dark-scope">
+    <details class="card" id="settingsPanel">
+      <summary><h2>Settings · reconstruction</h2><span class="muted small">vision-only by default (no GPS, no IMU) · drone takes follow the drone's Indoor/Outdoor switch</span></summary>
+      <div class="form form-2">
+        <label>Frames per VGGT window
+          <input type="text" data-setting="recon.window_frames" placeholder="auto">
+          <span class="small muted">"auto" = as many as fit in VRAM</span>
+        </label>
+        <label>Window overlap (frames)
+          <input type="number" min="2" max="64" data-setting="recon.overlap" data-type="int">
+        </label>
+        <label>Frame stride
+          <input type="number" min="1" max="30" data-setting="recon.frame_stride" data-type="int">
+          <span class="small muted">1 = use every frame</span>
+        </label>
+        <label>Confidence percentile
+          <input type="number" min="0" max="95" data-setting="recon.conf_percentile" data-type="int">
+          <span class="small muted">lower keeps more (noisier) points</span>
+        </label>
+        <label>Cloud density (voxel factor)
+          <input type="number" min="0.25" max="4" step="0.25" data-setting="recon.voxel_factor" data-type="float">
+          <span class="small muted">1 = one point per pixel footprint; smaller = denser</span>
+        </label>
+        <label>Min views per point
+          <input type="number" min="1" max="10" data-setting="recon.min_views" data-type="int">
+        </label>
+        <label>Poisson depth
+          <input type="number" min="7" max="12" data-setting="recon.poisson_depth" data-type="int">
+        </label>
+        <label>GPS (phone takes and video files)
+          <select data-setting="recon.gps_mode">
+            <option value="off">off (indoor)</option>
+            <option value="global">georeference (outdoor)</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" data-setting="recon.masking"> Mask people / moving objects</label>
+        <label class="check"><input type="checkbox" data-setting="recon.extras"> Also write LAS, OBJ/GLB, COLMAP</label>
+      </div>
+    </details>
+</section>
 <main class="grid">
   <!-- ============================================================ left -->
   <section class="col-left">
@@ -58,10 +114,11 @@
         <label class="check small" id="droneLiveReconRow" title="Reconstructs window by window as the take records, instead of after it stops - holds the GPU for the whole take (~7-8 fps VGGT throughput), so no other reconstruction can run at the same time">
           <input type="checkbox" id="droneLiveReconChk"> Live reconstruct
         </label>
+        <label class="check small" title="One shared contrast curve, light denoise and mild sharpen on every frame, for live and after-recording reconstruction. Applies to the next take"><input type="checkbox" data-setting="drone.enhance"> Enhance image quality</label>
         <button id="droneRecordBtn" class="record-btn" disabled>Start recording</button>
         <div class="rec-stats" id="droneRecStats"></div>
         <div class="hint small muted" id="droneRecHint"></div>
-        <div id="droneLiveViz" class="live-viz hidden"><iframe id="droneLiveVizFrame" title="Live reconstruction"></iframe></div>
+        <div id="droneLiveViz" class="live-viz dark-scope hidden"><iframe id="droneLiveVizFrame" title="Live reconstruction"></iframe></div>
       </div>
 
       <details class="card" id="droneCalibCard">
@@ -146,10 +203,11 @@
         <label class="check small" id="liveReconRow" title="Reconstructs window by window as the take records, instead of after it stops - holds the GPU for the whole take (~7-8 fps VGGT throughput), so no other reconstruction can run at the same time">
           <input type="checkbox" id="liveReconChk"> Live reconstruct
         </label>
+        <label class="check small" title="One shared contrast curve, light denoise and mild sharpen on every frame, for live and after-recording reconstruction. Applies to the next take"><input type="checkbox" data-setting="recon.enhance"> Enhance image quality</label>
         <button id="recordBtn" class="record-btn" disabled>Start recording</button>
         <div class="rec-stats" id="recStats"></div>
         <div class="hint small muted" id="recHint"></div>
-        <div id="liveViz" class="live-viz hidden"><iframe id="liveVizFrame" title="Live reconstruction"></iframe></div>
+        <div id="liveViz" class="live-viz dark-scope hidden"><iframe id="liveVizFrame" title="Live reconstruction"></iframe></div>
       </div>
 
       <div class="card">
@@ -184,21 +242,31 @@
     <div class="card">
       <div class="card-head">
         <h2>Video file</h2>
-        <span class="muted small">no phone app needed - upload a clip from this device, or record one</span>
+        <span class="muted small">no phone app needed - upload a clip, or a .zip of image frames or of a video, or record one</span>
       </div>
       <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-        <label class="btn primary">Upload video &amp; reconstruct
-          <input type="file" id="videoUploadFile" accept="video/*" hidden>
+        <label class="btn primary">Upload video or .zip &amp; reconstruct
+          <input type="file" id="videoUploadFile" accept="video/*,.zip,application/zip" hidden>
         </label>
         <label class="btn">Record with camera
           <input type="file" id="videoCaptureFile" accept="video/*" capture="environment" hidden>
         </label>
       </div>
+      <div class="row" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+        <label class="small" title="Straightens a wide-angle drone lens before VGGT, from the field of view below (an estimate - a checkerboard calibration is more accurate)"><input type="checkbox" id="videoFisheye"> Fisheye correction</label>
+        <label class="small" title="One shared contrast curve, light denoise and mild sharpen on every frame. Cannot add detail the video does not have - compare with and without"><input type="checkbox" id="videoEnhance"> Image enhancement</label>
+        <label class="small" title="Feeds VGGT only the frames where the camera has actually moved (about one in three for smooth footage) instead of all 30 per second. About 2x faster on a test clip, with denser surfaces than sparser sampling. Untick to use every frame"><input type="checkbox" id="videoFast" checked> Fast mode (frames chosen by motion)</label>
+        <span id="videoFisheyeFov" class="small muted" hidden>
+          field of view
+          <input type="number" id="videoHfov" value="124" min="30" max="359" step="1" style="width:5em"> &deg; horizontal &times;
+          <input type="number" id="videoVfov" value="60" min="20" max="359" step="1" style="width:5em"> &deg; vertical
+        </span>
+      </div>
       <div id="videoUploadStatus" class="small muted"></div>
       <details style="margin-top:8px">
-        <summary class="small muted">…or a file already on the Studio PC</summary>
+        <summary class="small muted">…or a file or folder of frames already on the Studio PC</summary>
         <div class="form">
-          <label>Path to video file, on the Studio PC
+          <label>Path to a video file or an image-frames folder, on the Studio PC
             <input type="text" id="videoPath" placeholder="C:\path\to\clip.mp4">
           </label>
         </div>
@@ -221,44 +289,6 @@
       <div id="sessions" class="sessions"><div class="muted">No recordings yet.</div></div>
     </div>
 
-    <details class="card" id="reconCard">
-      <summary><h2>Reconstruction settings</h2><span class="muted small">vision-only by default (no GPS, no IMU) · drone takes follow the drone's Indoor/Outdoor switch</span></summary>
-      <div class="form form-2">
-        <label>Frames per VGGT window
-          <input type="text" data-setting="recon.window_frames" placeholder="auto">
-          <span class="small muted">"auto" = as many as fit in VRAM</span>
-        </label>
-        <label>Window overlap (frames)
-          <input type="number" min="2" max="64" data-setting="recon.overlap" data-type="int">
-        </label>
-        <label>Frame stride
-          <input type="number" min="1" max="30" data-setting="recon.frame_stride" data-type="int">
-          <span class="small muted">1 = use every frame</span>
-        </label>
-        <label>Confidence percentile
-          <input type="number" min="0" max="95" data-setting="recon.conf_percentile" data-type="int">
-          <span class="small muted">lower keeps more (noisier) points</span>
-        </label>
-        <label>Cloud density (voxel factor)
-          <input type="number" min="0.25" max="4" step="0.25" data-setting="recon.voxel_factor" data-type="float">
-          <span class="small muted">1 = one point per pixel footprint; smaller = denser</span>
-        </label>
-        <label>Min views per point
-          <input type="number" min="1" max="10" data-setting="recon.min_views" data-type="int">
-        </label>
-        <label>Poisson depth
-          <input type="number" min="7" max="12" data-setting="recon.poisson_depth" data-type="int">
-        </label>
-        <label>GPS (phone takes and video files)
-          <select data-setting="recon.gps_mode">
-            <option value="off">off (indoor)</option>
-            <option value="global">georeference (outdoor)</option>
-          </select>
-        </label>
-        <label class="check"><input type="checkbox" data-setting="recon.masking"> Mask people / moving objects</label>
-        <label class="check"><input type="checkbox" data-setting="recon.extras"> Also write LAS, OBJ/GLB, COLMAP</label>
-      </div>
-    </details>
 
     <details class="card">
       <summary><h2>Event log</h2></summary>
@@ -266,9 +296,348 @@
     </details>
   </section>
 </main>
+</div>
+
+<div id="viewHome" class="home">
+
+  <!-- ================================================================ hero -->
+  <section class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <div class="eyebrow">Real-time visual reconstruction</div>
+        <h1>Turn ordinary video into a <em>3D model</em> in minutes.</h1>
+        <p>RTVIO reconstructs a dense point cloud and a textured mesh from a phone, a drone or a plain video file.
+           One transformer pass replaces the slow match-everything-to-everything loop of classical photogrammetry.</p>
+        <div class="cta">
+          <a class="btn btn-lg btn-fill" href="#/studio">Open RTVIO Studio</a>
+          <a class="btn btn-lg" href="#benchmarks" data-scroll>See benchmarks</a>
+        </div>
+        <div class="chips">
+          <div class="chip"><b>102 s</b><span>1033-frame 1080p clip</span></div>
+          <div class="chip"><b>2.3×</b><span>faster than every-frame</span></div>
+          <div class="chip"><b>3 inputs</b><span>phone · drone · mp4</span></div>
+        </div>
+      </div>
+      <figure class="hero-shot">
+        <img src="/static/img/ref-campus-mesh.jpg" alt="Reference: textured 3D mesh of a campus built from a drone survey" loading="eager">
+        <figcaption>Reference imagery · textured survey mesh · third-party</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ========================================================== inputs -->
+  <section class="section">
+    <div class="wrap">
+      <div class="eyebrow">Capture</div>
+      <h2 class="title">Three ways in, one pipeline</h2>
+      <p class="lead">Every source ends up as the same thing - a session of timestamped frames - so the same reconstruction, viewer and export tools work for all of them.</p>
+      <div class="cards-3">
+        <div class="feature"><div class="ico">📱</div><h3>Phone app</h3>
+          <p>Android app streams camera, IMU and GPS to the Studio over LAN, Tailscale or an HTTPS tunnel. Reconstruct live while recording, or after.</p></div>
+        <div class="feature"><div class="ico">🛸</div><h3>Drone link</h3>
+          <p>RTSP video and MAVLink telemetry straight from the drone. Fisheye lens calibration, indoor and outdoor modes, GPS georeferencing.</p></div>
+        <div class="feature"><div class="ico">🎞</div><h3>Video upload</h3>
+          <p>Drop in an mp4, or a .zip of image frames or of a video. Optional fisheye correction, image enhancement and motion-based frame selection before reconstruction.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="split">
+        <div>
+          <div class="eyebrow">Capture paths</div>
+          <h2 class="title">Fly it the way the model wants to be seen</h2>
+          <p class="lead" style="margin-bottom:12px">Orbits and lawn-mower passes give every surface several views from different angles. RTVIO picks the frames for you from how the camera actually moved, so a slow orbit is not thinned out and a hover is not counted twice.</p>
+          <ul class="ticks">
+            <li>Keep the subject in frame and move smoothly - no need to stop at each position.</li>
+            <li>Overlap generously; the more views of a surface, the cleaner it fuses.</li>
+            <li>Loop back over your start point when you can.</li>
+          </ul>
+        </div>
+        <figure class="shot"><img src="/static/img/ref-capture-path.jpg" alt="Reference: drone orbit capture path around a church with the resulting model" loading="lazy"><figcaption><b>Orbit capture path</b> · reference · third-party</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ====================================================== methodology -->
+  <section class="section" id="methodology">
+    <div class="wrap">
+      <div class="eyebrow">Methodology</div>
+      <h2 class="title">From frames to a mesh</h2>
+      <p class="lead">Seven stages, each one a small, testable step. Nothing here needs COLMAP, a sparse map or camera calibration up front.</p>
+      <div class="steps">
+        <div class="step"><h3>Select frames</h3><p>Lucas-Kanade tracking measures how far the view moved. A frame is kept only when the camera has really travelled, so a 30 fps clip becomes well-spaced views.</p></div>
+        <div class="step"><h3>Straighten the lens</h3><p>Wide-angle drone footage is remapped to an ideal pinhole image (<code>fisheye</code> calibration or a field-of-view estimate), because VGGT assumes a pinhole camera.</p></div>
+        <div class="step"><h3>Predict geometry</h3><p>VGGT-1B reads a window of up to 64 frames at once and outputs camera poses and a depth map with confidence for every frame.</p></div>
+        <div class="step"><h3>Filter</h3><p>Low-confidence pixels, depth edges and grazing normals are dropped on the GPU before anything is fused.</p></div>
+        <div class="step"><h3>Chain the windows</h3><p>Neighbouring windows share frames. A robust Sim(3) fit over those overlaps aligns each window to the last, correcting scale as well as pose.</p></div>
+        <div class="step"><h3>Fuse</h3><p>Points from all windows go into one voxel accumulator that tracks colour, normal and how many frames saw each point. Points seen only once are removed.</p></div>
+        <div class="step"><h3>Mesh &amp; export</h3><p>Screened Poisson surface reconstruction, distance trim and island removal. Export PLY, GLB, LAS or a COLMAP model; optional GPS alignment to real coordinates.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top:36px">
+    <div class="wrap">
+      <figure class="shot banner"><img src="/static/img/ref-city-mesh.jpg" alt="Reference: large photogrammetry mesh of an office park" loading="lazy"><figcaption><b>The goal for fuse, mesh and georeference</b> · large-area textured mesh · reference · third-party (Cesium viewer)</figcaption></figure>
+    </div>
+  </section>
+
+  <!-- ===================================================== architecture -->
+  <section class="section" id="architecture">
+    <div class="wrap">
+      <div class="eyebrow">Architecture</div>
+      <h2 class="title">System overview</h2>
+      <p class="lead">Reconstruction is treated as inference, not optimisation: a feed-forward transformer predicts cameras and depth for a whole window of frames at once, and a small amount of classical geometry ties the windows together.</p>
+
+      <div class="callouts">
+        <div class="callout"><b>Feed-forward geometry</b><span>No feature matching or bundle adjustment. One VGGT-1B pass gives poses, intrinsics and depth for up to 64 frames.</span></div>
+        <div class="callout"><b>Windowed, then chained</b><span>Overlapping windows are aligned by a robust Sim(3) fit, so length is limited by time, not by GPU memory.</span></div>
+        <div class="callout"><b>Always-warm worker</b><span>The model stays resident on the GPU; frame selection and attention kernels are tuned for a fast turn-around.</span></div>
+      </div>
+
+      <figure class="fig">
+        <div class="diagram paper">
+          <svg viewBox="0 0 1000 590" role="img" aria-label="Fig. 1. RTVIO reconstruction pipeline">
+            <defs>
+              <marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z"/></marker>
+            </defs>
+
+            <!-- module frames -->
+            <rect class="fr" x="14" y="40" width="238" height="480" rx="10"/><text class="ttl" x="26" y="60">(A) Ingest &amp; pre-processing</text>
+            <rect class="fr" x="266" y="40" width="384" height="480" rx="10"/><text class="ttl" x="278" y="60">(B) Feed-forward geometry · VGGT-1B</text>
+            <rect class="fr" x="664" y="40" width="322" height="480" rx="10"/><text class="ttl" x="676" y="60">(C) Global consistency &amp; surface</text>
+
+            <!-- A: sources -->
+            <rect class="box" x="30" y="76" width="206" height="26" rx="6"/><text class="sub" x="42" y="93">Phone · WebSocket / TCP · IMU, GPS</text>
+            <rect class="box" x="30" y="108" width="206" height="26" rx="6"/><text class="sub" x="42" y="125">Drone · RTSP video + MAVLink</text>
+            <rect class="box" x="30" y="140" width="206" height="26" rx="6"/><text class="sub" x="42" y="157">Video file · chunked mp4 upload</text>
+            <path class="arrow" d="M133 166 V190"/>
+            <!-- film strip -->
+            <g class="strip"><rect x="34" y="194" width="26" height="20" rx="2"/><rect x="66" y="194" width="26" height="20" rx="2"/><rect x="98" y="194" width="26" height="20" rx="2"/><rect x="130" y="194" width="26" height="20" rx="2"/><rect x="162" y="194" width="26" height="20" rx="2"/><rect x="194" y="194" width="26" height="20" rx="2"/></g>
+            <text class="eq" x="42" y="234">{ I<tspan dy="3" font-size="8">t</tspan><tspan dy="-3">  }, t = 1 … N</tspan></text>
+            <path class="arrow" d="M133 240 V258"/>
+            <!-- A: steps -->
+            <rect class="box" x="30" y="260" width="206" height="66" rx="8"/><circle class="bdg" cx="46" cy="276" r="9"/><text class="bdgt" x="46" y="280" text-anchor="middle">1</text>
+              <text x="62" y="280">Motion keyframes</text><text class="sub" x="42" y="298">Lucas–Kanade flow on 320 px frames</text><text class="sub" x="42" y="313">keep if median shift ≥ 0.5% W · gap ≤ 3</text>
+            <path class="arrow" d="M133 326 V342"/>
+            <rect class="box" x="30" y="344" width="206" height="66" rx="8"/><circle class="bdg" cx="46" cy="360" r="9"/><text class="bdgt" x="46" y="364" text-anchor="middle">2</text>
+              <text x="62" y="364">Lens rectification</text><text class="sub" x="42" y="382">fisheye → pinhole remap (K, D)</text><text class="sub" x="42" y="397">calibrated, or from a field-of-view model</text>
+            <path class="arrow" d="M133 410 V426"/>
+            <rect class="box alt" x="30" y="428" width="206" height="66" rx="8"/><circle class="bdg" cx="46" cy="444" r="9"/><text class="bdgt" x="46" y="448" text-anchor="middle">3</text>
+              <text x="62" y="448">Photometric norm. (opt.)</text><text class="sub" x="42" y="466">one shared tone LUT for the clip</text><text class="sub" x="42" y="481">edge-preserving denoise · mild sharpen</text>
+
+            <!-- A -> B -->
+            <path class="arrow" d="M236 461 H262 V112 H288"/>
+            <text class="eq" x="226" y="510" text-anchor="end">Ĩ<tspan dy="3" font-size="8">t</tspan><tspan dy="-3"> ∈ ℝ</tspan><tspan dy="-4" font-size="8">518×294×3</tspan></text>
+
+            <!-- B -->
+            <rect class="box" x="282" y="76" width="352" height="56" rx="8"/><circle class="bdg" cx="298" cy="92" r="9"/><text class="bdgt" x="298" y="96" text-anchor="middle">4</text>
+              <text x="314" y="96">Patch embedding</text><text class="sub" x="294" y="114">DINOv2 ViT-L/14 · 14 px patches · 777 tokens per frame</text>
+            <path class="arrow" d="M458 132 V150"/>
+            <rect class="box hot" x="282" y="152" width="352" height="122" rx="8"/><circle class="bdg" cx="298" cy="168" r="9"/><text class="bdgt" x="298" y="172" text-anchor="middle">5</text>
+              <text x="314" y="172">Alternating-attention aggregator</text>
+              <g class="aa"><rect x="296" y="186" width="22" height="16" rx="3" class="f"/><rect x="322" y="186" width="22" height="16" rx="3" class="g"/><rect x="348" y="186" width="22" height="16" rx="3" class="f"/><rect x="374" y="186" width="22" height="16" rx="3" class="g"/><rect x="400" y="186" width="22" height="16" rx="3" class="f"/><rect x="426" y="186" width="22" height="16" rx="3" class="g"/><text class="eq" x="458" y="199">× 24 blocks</text></g>
+              <text class="sub" x="296" y="222"><tspan class="kf">■</tspan> frame attention   <tspan class="kg">■</tspan> global attention (whole window)</text>
+              <text class="sub" x="296" y="240">global attention spans W · 777 ≈ 5·10⁴ tokens for W = 64</text>
+              <text class="sub" x="296" y="258">fused cuDNN scaled-dot-product attention · bf16</text>
+            <path class="arrow" d="M370 274 V294"/><path class="arrow" d="M546 274 V294"/>
+            <rect class="box" x="282" y="296" width="168" height="62" rx="8"/><circle class="bdg" cx="298" cy="312" r="9"/><text class="bdgt" x="298" y="316" text-anchor="middle">6</text>
+              <text x="314" y="316">Camera head</text><text class="eq" x="294" y="338">g<tspan dy="3" font-size="8">t</tspan><tspan dy="-3"> ∈ SE(3),  K</tspan><tspan dy="3" font-size="8">t</tspan></text>
+            <rect class="box" x="466" y="296" width="168" height="62" rx="8"/><text x="480" y="316">DPT depth head</text><text class="eq" x="480" y="338">D<tspan dy="3" font-size="8">t</tspan><tspan dy="-3">,  confidence C</tspan><tspan dy="3" font-size="8">t</tspan></text>
+            <path class="arrow" d="M366 358 V380 H458"/><path class="arrow" d="M550 358 V380 H458"/><path class="arrow" d="M458 380 V392"/>
+            <rect class="box" x="282" y="394" width="352" height="112" rx="8"/><circle class="bdg" cx="298" cy="410" r="9"/><text class="bdgt" x="298" y="414" text-anchor="middle">7</text>
+              <text x="314" y="414">Unproject &amp; gate</text>
+              <text class="eq" x="294" y="440">P<tspan dy="3" font-size="8">t</tspan><tspan dy="-3"> = g</tspan><tspan dy="3" font-size="8">t</tspan><tspan dy="-3"> · π</tspan><tspan dy="-4" font-size="8">−1</tspan><tspan dy="4">( D</tspan><tspan dy="3" font-size="8">t</tspan><tspan dy="-3">, K</tspan><tspan dy="3" font-size="8">t</tspan><tspan dy="-3"> )</tspan></text>
+              <text class="sub" x="294" y="462">keep  C<tspan dy="2" font-size="7">t</tspan><tspan dy="-2"> ≥ τ</tspan><tspan dy="2" font-size="7">c</tspan><tspan dy="-2">  (50th percentile)</tspan></text>
+              <text class="sub" x="294" y="478">reject depth edges  |∇D| / D &gt; 0.04  and grazing normals</text>
+              <text class="sub" x="294" y="494">optional: mask people / moving objects (YOLO)</text>
+
+            <!-- B -> C -->
+            <path class="arrow" d="M634 450 H650 V121 H690"/>
+<!-- C -->
+            <rect class="box hot" x="680" y="76" width="292" height="90" rx="8"/><circle class="bdg" cx="696" cy="92" r="9"/><text class="bdgt" x="696" y="96" text-anchor="middle">8</text>
+              <text x="712" y="96">Sim(3) window chaining</text>
+              <text class="eq" x="692" y="120">(s, R, t) = argmin Σ ρ( ‖ P<tspan dy="3" font-size="8">w</tspan><tspan dy="-3"> − (sR P</tspan><tspan dy="3" font-size="8">w−1</tspan><tspan dy="-3"> + t) ‖ )</tspan></text>
+              <text class="sub" x="692" y="142">over the k shared frames · RANSAC + IRLS</text>
+              <text class="sub" x="692" y="157">scale, rotation and translation are all recovered</text>
+            <path class="arrow" d="M826 166 V188"/>
+            <rect class="box" x="680" y="190" width="292" height="78" rx="8"/><circle class="bdg" cx="696" cy="206" r="9"/><text class="bdgt" x="696" y="210" text-anchor="middle">9</text>
+              <text x="712" y="210">Voxel fusion</text>
+              <text class="sub" x="692" y="232">mean colour and normal per voxel v</text>
+              <text class="sub" x="692" y="247">keep  views(v) ≥ 2 · statistical outlier removal</text>
+            <path class="arrow" d="M826 268 V290"/>
+            <rect class="box" x="680" y="292" width="292" height="78" rx="8"/><circle class="bdg" cx="696" cy="308" r="9"/><text class="bdgt" x="696" y="312" text-anchor="middle">10</text>
+              <text x="712" y="312">Surface reconstruction</text>
+              <text class="sub" x="692" y="334">screened Poisson, octree depth 10</text>
+              <text class="sub" x="692" y="349">distance trim · small-island removal</text>
+            <path class="arrow" d="M826 370 V392"/>
+            <rect class="box alt" x="680" y="394" width="292" height="66" rx="8"/><circle class="bdg" cx="696" cy="410" r="9"/><text class="bdgt" x="696" y="414" text-anchor="middle">11</text>
+              <text x="712" y="414">Georeference (optional)</text>
+              <text class="sub" x="692" y="436">Sim(3) to GPS fixes → ENU metres</text>
+              <text class="sub" x="692" y="451">or stay relative (vision only)</text>
+            <path class="arrow" d="M826 460 V474"/>
+            <rect class="box out" x="680" y="476" width="292" height="34" rx="8"/><text class="sub out" x="692" y="497">cloud_raw.ply · mesh_poisson.ply · cameras.json · GLB · LAS</text>
+
+            <!-- sliding-window feedback -->
+            <path class="arrow dash" d="M980 520 V556 H458 V526"/>
+            <text class="eq" x="470" y="574">next window w+1 :  shares k = 8 frames with w</text>
+          </svg>
+        </div>
+        <figcaption class="fig-cap"><b>Fig. 1.</b> Overview of the RTVIO reconstruction pipeline. Frames from a phone, drone or video file are thinned by image motion (1), rectified to a pinhole model (2) and optionally photometrically normalised (3). Overlapping windows of up to <i>W</i> = 64 frames pass through a feed-forward VGGT-1B (4–6) that predicts cameras <i>g<sub>t</sub></i>, <i>K<sub>t</sub></i> and depth <i>D<sub>t</sub></i> with confidence <i>C<sub>t</sub></i>. Per-window point maps are gated (7), chained into one frame by a robust Sim(3) fit over the <i>k</i> shared frames (8), fused into a voxel map (9) and meshed (10). Optional GPS alignment (11) gives metric ENU coordinates.</figcaption>
+      </figure>
+
+      <figure class="fig" style="margin-top:26px">
+        <div class="diagram paper">
+          <svg viewBox="0 0 1000 300" role="img" aria-label="Fig. 2. RTVIO Studio deployment view">
+            <defs><marker id="ah2" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z"/></marker></defs>
+            <rect class="fr" x="14" y="20" width="220" height="262" rx="10"/><text class="ttl" x="26" y="40">Sources</text>
+            <rect class="fr" x="262" y="20" width="470" height="262" rx="10"/><text class="ttl" x="274" y="40">RTVIO Studio server (one process)</text>
+            <rect class="fr" x="760" y="20" width="226" height="262" rx="10"/><text class="ttl" x="772" y="40">Clients &amp; outputs</text>
+
+            <rect class="box" x="30" y="58" width="188" height="62" rx="8"/><text x="44" y="82">Android app</text><text class="sub" x="44" y="100">camera · IMU · GPS</text>
+            <rect class="box" x="30" y="132" width="188" height="62" rx="8"/><text x="44" y="156">Drone</text><text class="sub" x="44" y="174">RTSP · MAVLink</text>
+            <rect class="box" x="30" y="206" width="188" height="62" rx="8"/><text x="44" y="230">Browser upload</text><text class="sub" x="44" y="248">mp4, chunked</text>
+            <path class="arrow" d="M218 89 H262"/><path class="arrow" d="M218 163 H262"/><path class="arrow" d="M218 237 H262"/>
+
+            <rect class="box" x="280" y="58" width="210" height="62" rx="8"/><text x="294" y="82">Session store</text><text class="sub" x="294" y="100">frames · GPS · telemetry</text>
+            <rect class="box" x="506" y="58" width="210" height="62" rx="8"/><text x="520" y="82">Job queue</text><text class="sub" x="520" y="100">one GPU job at a time</text>
+            <path class="arrow" d="M490 89 H506"/>
+            <rect class="box hot" x="280" y="138" width="436" height="80" rx="8"/><text x="294" y="162">Warm VGGT worker</text>
+              <text class="sub" x="294" y="182">model resident on the GPU · cuDNN attention</text><text class="sub" x="294" y="200">pipeline of Fig. 1 · progress and live preview streamed (SSE)</text>
+            <path class="arrow" d="M611 120 V138"/>
+            <rect class="box" x="280" y="232" width="436" height="38" rx="8"/><text x="294" y="256">HTTP API · sign-in · /viz proxy · web UI</text>
+
+            <rect class="box" x="776" y="58" width="194" height="62" rx="8"/><text x="790" y="82">3D viewer</text><text class="sub" x="790" y="100">cloud · mesh · live</text>
+            <rect class="box" x="776" y="138" width="194" height="62" rx="8"/><text x="790" y="162">Exports</text><text class="sub" x="790" y="180">PLY · GLB · LAS · COLMAP · .zip</text>
+            <rect class="box" x="776" y="216" width="194" height="52" rx="8"/><text x="790" y="238">Session library</text><text class="sub" x="790" y="256">re-run · view · delete</text>
+            <path class="arrow" d="M716 178 H738 V89 H776"/><path class="arrow" d="M738 178 V167 H776"/>
+          </svg>
+        </div>
+        <figcaption class="fig-cap"><b>Fig. 2.</b> Deployment view. Phone, drone and browser uploads all become sessions of timestamped frames. A queue feeds a single long-lived GPU worker that runs the pipeline of Fig. 1 with the model already loaded; the web UI streams progress and the growing point cloud back to the viewer.</figcaption>
+      </figure>
+
+      <div class="tbl-cap"><b>TABLE I</b> &nbsp; KEY PARAMETERS AND DEFAULTS</div>
+      <div class="table-wrap">
+        <table class="params">
+          <thead><tr><th>Symbol</th><th>Meaning</th><th>Default</th></tr></thead>
+          <tbody>
+            <tr><td><i>W</i></td><td>Frames per VGGT window (chosen from free VRAM)</td><td>auto, ≤ 64</td></tr>
+            <tr><td><i>k</i></td><td>Frames shared by consecutive windows (Sim(3) correspondences)</td><td>8</td></tr>
+            <tr><td>input</td><td>Width VGGT sees each frame at (14 px patches)</td><td>518 px</td></tr>
+            <tr><td>Δ, gap</td><td>Keyframe rule: median feature shift as a fraction of frame width, and maximum skipped frames</td><td>0.5%, 3</td></tr>
+            <tr><td><i>τ<sub>c</sub></i></td><td>Confidence gate, percentile of the window's confidences</td><td>50</td></tr>
+            <tr><td>|∇D| / D</td><td>Relative depth-jump threshold for edge rejection</td><td>0.04</td></tr>
+            <tr><td>views(v)</td><td>Minimum frames that must see a voxel</td><td>2</td></tr>
+            <tr><td>depth</td><td>Screened-Poisson octree depth</td><td>10</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+      <!-- ========================================================= benchmarks -->
+  <section class="section" id="benchmarks">
+    <div class="wrap">
+      <div class="eyebrow">Benchmarks</div>
+      <h2 class="title">Measured, not estimated</h2>
+      <p class="lead">Run on one machine (RTX 5070 Ti, 16 GB) with one 1033-frame, 1920×1080 test clip. These are our own timings from the logs and profiling runs in this repository, not a general claim about every scene.</p>
+      <div class="bench">
+        <div class="panel">
+          <h3>End-to-end reconstruction time</h3>
+          <div class="sub">Same clip, same mesh depth · lower is better</div>
+          <div class="big-num"><b>2.3×</b><span>faster · 231 s → 102 s</span></div>
+          <div class="bar-row"><span class="lbl">Every frame</span><div class="bar"><i style="width:100%"></i></div><span class="val">231 s</span></div>
+          <div class="bar-row"><span class="lbl">Fast mode</span><div class="bar"><i class="good" style="width:44%"></i></div><span class="val">102 s</span></div>
+          <div class="bar-row"><span class="lbl">Fast, half the frames</span><div class="bar"><i class="good" style="width:34%"></i></div><span class="val">79 s</span></div>
+          <div class="fine">Fast mode keeps 346 of 1033 frames (one when the view has moved ≈0.5% of the frame width, never skipping more than 3). Halving that to 173 frames gave 79 s but visibly sparser surfaces, so 346 is the default. Every-frame runs showed more speckle, because many more windows are chained together.</div>
+        </div>
+        <div class="panel">
+          <h3>VGGT window, 64 frames</h3>
+          <div class="sub">Attention kernel · lower is better</div>
+          <div class="big-num"><b>1.56×</b><span>faster · 7.98 s → 5.11 s</span></div>
+          <div class="bar-row"><span class="lbl">Default kernel</span><div class="bar"><i style="width:100%"></i></div><span class="val">7.98 s</span></div>
+          <div class="bar-row"><span class="lbl">cuDNN attention</span><div class="bar"><i class="good" style="width:64%"></i></div><span class="val">5.11 s</span></div>
+          <div class="fine">Output matches to 0.1% median depth. The Windows PyTorch build has no flash attention, so cuDNN is requested explicitly.</div>
+        </div>
+        <div class="panel">
+          <h3>Poisson mesh size vs. time</h3>
+          <div class="sub">2.7 M-point cloud · the depth is a quality / cost dial</div>
+          <div class="bar-row"><span class="lbl">Depth 10</span><div class="bar"><i style="width:100%"></i></div><span class="val">73 s</span></div>
+          <div class="bar-row"><span class="lbl">Depth 9</span><div class="bar"><i class="good" style="width:21%"></i></div><span class="val">15.7 s</span></div>
+          <div class="bar-row"><span class="lbl">Depth 8</span><div class="bar"><i class="good" style="width:6%"></i></div><span class="val">4.3 s</span></div>
+          <div class="fine">Depth 10 → 10.3 M faces (272 MB), depth 9 → 1.4 M (37 MB), depth 8 → 149 K (4 MB).</div>
+        </div>
+        <div class="panel">
+          <h3>Warm model</h3>
+          <div class="sub">VGGT stays on the GPU between jobs</div>
+          <div class="big-num"><b>0 s</b><span>model load per job (was ≈13 s)</span></div>
+          <div class="bar-row"><span class="lbl">Worker start</span><div class="bar"><i style="width:100%"></i></div><span class="val">14 s</span></div>
+          <div class="bar-row"><span class="lbl">Second job</span><div class="bar"><i class="good" style="width:2%"></i></div><span class="val">0 s</span></div>
+          <div class="fine">Throughput in the worker: 9–10.6 frames/s through VGGT, against about 7 frames/s before.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ vs colmap -->
+  <section class="section" id="compare">
+    <div class="wrap">
+      <div class="eyebrow">Why RTVIO</div>
+      <h2 class="title">Compared with COLMAP and classical pipelines</h2>
+      <p class="lead">COLMAP is an excellent, well-proven tool and still the accuracy reference in good conditions. RTVIO trades a little of that peak precision for speed, robustness and a live workflow. We have not run COLMAP head-to-head on this clip, so the table describes how the methods behave, not measured numbers.</p>
+      <div class="table-wrap">
+        <table class="cmp">
+          <thead><tr><th>Aspect</th><th>COLMAP · classical SfM / MVS</th><th class="us">RTVIO</th></tr></thead>
+          <tbody>
+            <tr><td>Method</td><td>Detect features, match image pairs, incremental structure-from-motion, bundle adjustment, then PatchMatch dense stereo.</td><td class="us">A feed-forward transformer predicts poses and depth for whole windows of frames; windows are chained with a robust Sim(3).</td></tr>
+            <tr><td>Speed on video</td><td><span class="tag-lose">slower</span>Matching and bundle adjustment grow with the number of frames; hundreds of frames usually take many minutes to hours.</td><td class="us"><span class="tag-win">faster</span>Roughly linear in windows. 1033 frames in 102 s here, and a new job starts with the model already loaded.</td></tr>
+            <tr><td>Low texture, glass, night</td><td><span class="tag-lose">fragile</span>Needs distinctive features; blank walls, reflections and dark scenes cause failed matches and holes.</td><td class="us"><span class="tag-win">robust</span>Learned depth priors fill weak areas - reflective glass and blank walls still come out as surfaces.</td></tr>
+            <tr><td>Small baseline, rotation, blur</td><td><span class="tag-lose">fragile</span>Initialisation needs parallax; pure rotation and motion blur reduce matches.</td><td class="us"><span class="tag-win">tolerant</span>Works from smooth handheld or drone motion; frame selection removes near-duplicates.</td></tr>
+            <tr><td>Live / streaming</td><td><span class="tag-lose">offline</span>Batch process: capture first, reconstruct afterwards.</td><td class="us"><span class="tag-win">live</span>Reconstructs window by window while a phone or drone is still recording, with a live 3D view.</td></tr>
+            <tr><td>Peak accuracy</td><td><span class="tag-win">stronger</span>Sub-pixel bundle adjustment on high-resolution, well-textured, high-overlap images is still the reference.</td><td class="us"><span class="tag-lose">lower</span>VGGT sees frames at ≈518 px wide; fine geometry is limited by that and by drift across chained windows.</td></tr>
+            <tr><td>Scale &amp; georeference</td><td><span class="tag-tie">tie</span>Relative scale unless you add control points or GPS priors.</td><td class="us"><span class="tag-tie">tie</span>Relative scale from video alone; with GPS a Sim(3) fit gives metric ENU coordinates.</td></tr>
+            <tr><td>Lens handling</td><td>Calibrates camera models inside bundle adjustment.</td><td class="us">Needs a pinhole image, so wide-angle lenses are corrected first (checkerboard calibration or a field-of-view estimate).</td></tr>
+            <tr><td>Hardware</td><td>SfM runs on CPU; dense stereo needs a CUDA GPU.</td><td class="us">Needs a CUDA GPU with roughly 4 GB or more; more VRAM allows longer windows.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="fine">Use COLMAP when you have a high-resolution, well-textured photo set and time to spare. Use RTVIO when you have video, want results in minutes, or want to watch the model grow while you fly.</p>
+    </div>
+  </section>
+
+  <!-- ================================================================ CTA -->
+  <section class="section">
+    <div class="wrap">
+      <div class="panel cta-panel">
+        <div><h3 style="font-size:16px">Ready to reconstruct something?</h3><div class="sub" style="margin:2px 0 0">Connect a phone or drone, or drop in a video.</div>
+</div>
+        <a class="btn btn-lg btn-fill" href="#/studio">Open RTVIO Studio</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= footer -->
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="foot-grid">
+        <div>
+          <a class="brand" href="#/home" style="margin:0"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#logo"/></svg>RTVIO <span>Studio</span></a>
+          <p>Georeferenced 3D reconstruction from phone, drone and video. Built for fast, watch-it-grow results.</p>
+        </div>
+        <div><h4>Product</h4><a href="#/home">Home</a><a href="#/studio">RTVIO Studio</a></div>
+        <div><h4>Explore</h4><a href="#methodology" data-scroll>Methodology</a><a href="#architecture" data-scroll>Architecture</a><a href="#benchmarks" data-scroll>Benchmarks</a><a href="#compare" data-scroll>vs. COLMAP</a></div>
+        <div><h4>Built with</h4><span class="small muted" style="display:block;line-height:1.9">VGGT · PyTorch · OpenCV<br>PyMeshLab · three.js · MAVLink</span></div>
+      </div>
+      <div class="foot-base"><span>© 2026 RTVIO. All rights reserved.</span><span>Benchmarks: RTX 5070 Ti, single-clip test. Results vary by scene and hardware.</span></div>
+    </div>
+  </footer>
+</div>
+
 
 <!-- ============================================================ viewer -->
-<div id="viewer" class="viewer hidden">
+<div id="viewer" class="viewer dark-scope hidden">
   <div class="viewer-bar">
     <b id="viewerTitle">Viewer</b>
     <div class="seg" id="viewerKind">
@@ -279,7 +648,13 @@
     <label class="small check"><input type="checkbox" id="litMesh"> shaded</label>
     <label class="small check"><input type="checkbox" id="wireMesh"> wireframe</label>
     <label class="small check"><input type="checkbox" id="showCams" checked> cameras</label>
+    <button id="viewerFull" class="hidden" title="Load the full-resolution mesh (much larger download)">Full detail</button>
     <button id="viewerReset">Reset view</button>
+    <button id="viewerFlip" title="Turn the model 180° (fixes an upside-down reconstruction)">Flip upside-down</button>
+    <label class="small">tilt <input type="range" id="rotX" min="0" max="360" step="1" value="180"></label>
+    <label class="small">turn <input type="range" id="rotY" min="0" max="360" step="1" value="0"></label>
+    <label class="small">roll <input type="range" id="rotZ" min="0" max="360" step="1" value="0"></label>
+    <button id="viewerRotReset">Default rotation</button>
     <a id="viewerDownload" class="btn" download>Download</a>
     <span class="muted small" id="viewerInfo"></span>
     <button id="viewerClose" class="close">✕</button>
@@ -315,5 +690,7 @@
 <script src="/static/vendor/OrbitControls.js"></script>
 <script src="/static/vendor/PLYLoader.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/nav.js"></script>
+<script src="/static/bgfx.js"></script>
 </body>
 </html>

@@ -49,6 +49,9 @@ from ..stream import protocol
 START_CONFIRM_TIMEOUT_S = 8.0   # phone must report "recording" this soon after START
 RESUME_GRACE_S = 120.0          # a phone that drops mid-take may reconnect and keep uploading
 LEGACY_IDLE_FINALIZE_S = 3.0    # v1 app: its auto-session ends this long after frames stop
+# The first byte of every packet the phone sends on the live connection. Anything else is not the phone.
+LIVE_HEADERS = (protocol.HEADER_FRAME, protocol.HEADER_PREVIEW, protocol.HEADER_IMU, protocol.HEADER_GPS,
+                protocol.HEADER_INTRINSICS, protocol.HEADER_STATUS)
 SOCKET_IDLE_TIMEOUT_S = 15.0    # a v2 phone sends STATUS every second; silence this long = dead link
 SESSION_TRANSFER_IDLE_TIMEOUT_S = 120.0  # a bulk "Saved sessions -> Transfer" has no heartbeat at
                                           # all - it's just raw file bytes, possibly hundreds of MB
@@ -336,6 +339,21 @@ class PhoneLink:
                 # its own, much longer idle timeout.
                 conn.settimeout(SESSION_TRANSFER_IDLE_TIMEOUT_S)
                 self._receive_session_transfer(conn)
+                return
+
+            # Not one of the phone's live packets: something else is talking to this
+            # port. 5555 is also adb's standard port, and an adb server scans
+            # 127.0.0.1:5555 for emulators about once a second, opening with
+            # "CNXN" (0x43...). Claiming the slot for it would kick the real phone
+            # off every second - "connecting, connected for a second, disconnects,
+            # connecting..." on the app - so it is closed without touching the slot.
+            if header not in LIVE_HEADERS:
+                now = time.monotonic()
+                if now - getattr(self, "_last_ignored", 0.0) > 60.0:
+                    self._last_ignored = now
+                    self._event("ignored a non-RTVIO connection from %s:%d (first byte 0x%02X - "
+                                "adb scanning port %d? run `adb kill-server`)"
+                                % (addr[0], addr[1], header, self.port))
                 return
 
             # Anything else means this is the live-stream / remote-control

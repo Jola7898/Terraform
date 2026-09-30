@@ -23,6 +23,11 @@
     <!-- mDNS discovery of the desktop receiver. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
+    <!-- Is the Tailscale app installed? (Android 11+ hides other packages unless declared.) -->
+    <queries>
+        <package android:name="com.tailscale.ipn" />
+    </queries>
+
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
@@ -35,6 +40,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.RtvioMapper"
         tools:targetApi="34">
 

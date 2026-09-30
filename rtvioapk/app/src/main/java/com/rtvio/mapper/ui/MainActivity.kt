@@ -1,16 +1,32 @@
 package com.rtvio.mapper.ui
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Build
+import android.graphics.Color
 import android.os.Bundle
+import android.os.Environment
 import android.provider.Settings as AndroidSettings
 import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.CookieManager
+import android.webkit.DownloadListener
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -28,6 +44,8 @@ import com.rtvio.mapper.databinding.ActivityMainBinding
 import com.rtvio.mapper.net.ConnectionState
 import com.rtvio.mapper.net.ReceiverProbe
 import com.rtvio.mapper.net.StreamStats
+import com.rtvio.mapper.net.StudioApi
+import com.rtvio.mapper.net.Tailscale
 import com.rtvio.mapper.service.LinkState
 import com.rtvio.mapper.service.StreamingForegroundService
 import com.rtvio.mapper.service.StreamingSession
@@ -36,6 +54,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.util.Locale
 
 /**
@@ -48,6 +67,15 @@ import java.util.Locale
  *
  * All the moving parts live in [StreamingSession]; this class is limited to
  * permissions, rendering state and relaying user intent.
+ *
+ * STUDIO MODE: when Tailscale is on and the Studio answers at Settings ->
+ * Server IP, the screen also offers the Studio itself - the website, in a
+ * WebView over this screen - plus Live reconstruct / Enhance checkboxes that
+ * start and stop takes through the Studio's API and follow the reconstruction
+ * to its result. Without Tailscale (or on a different tailnet) none of that
+ * appears and the app behaves exactly as before. The WebView is an overlay in
+ * this activity rather than another activity because CameraX is bound to this
+ * activity's lifecycle: a second activity on top would stop the camera.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -67,6 +95,29 @@ class MainActivity : AppCompatActivity() {
     /** Last reachability result for Settings -> Server IP; null = not checked yet. */
     private var receiverReachable: Boolean? = null
     private val RECEIVER_POLL_MS = 5_000L
+
+    // ---- Studio mode state
+    private lateinit var studio: StudioApi
+    private var studioMode = false
+    private var tailscaleUp = false
+    private var autoConnectTried = false
+    private var takeSession: String? = null
+    private var shownResultFor: String? = null
+    private var studioWeb: WebView? = null
+    private var studioLoadFailed = false
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private val fileChooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
+        fileCallback = null
+    }
+    private val studioBack = object : OnBackPressedCallback(false) {
+        // Back steps back inside the website first (it closes the 3D viewer, which holds a
+        // history entry) and only then leaves the Studio for the camera screen.
+        override fun handleOnBackPressed() {
+            val web = studioWeb
+            if (web != null && web.canGoBack()) web.goBack() else hideStudio()
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -96,6 +147,8 @@ class MainActivity : AppCompatActivity() {
         settings = SettingsManager(this)
         session = StreamingSession(applicationContext, settings)
         specs = DeviceSpecsCollector(this)
+        studio = StudioApi(settings)
+        onBackPressedDispatcher.addCallback(this, studioBack)
 
         binding.toolbar.inflateMenu(R.menu.main_menu)
         binding.toolbar.setOnMenuItemClickListener { item ->
@@ -118,8 +171,18 @@ class MainActivity : AppCompatActivity() {
         binding.btnRecordLocal.setOnClickListener { onRecordLocalButton() }
         binding.btnRecord.setOnClickListener {
             it.performHapticFeedbackIfEnabled()
-            session.toggleRecording()
+            // In Studio mode the take is started through the Studio, so the
+            // Live / Enhance checkboxes apply; otherwise as before.
+            if (studioMode) studioToggleRecording() else session.toggleRecording()
         }
+        binding.chkLive.isChecked = settings.studioLive
+        binding.chkEnhance.isChecked = settings.studioEnhance
+        binding.chkLive.setOnCheckedChangeListener { _, on -> settings.studioLive = on }
+        binding.chkEnhance.setOnCheckedChangeListener { _, on -> settings.studioEnhance = on }
+        binding.btnOpenStudio.setOnClickListener { showStudio() }
+        binding.btnOpenResult.setOnClickListener { takeSession?.let { showStudio("#/studio/view/$it") } ?: showStudio() }
+        binding.btnStudioClose.setOnClickListener { hideStudio() }
+        binding.btnStudioReload.setOnClickListener { studioWeb?.reload() }
         binding.btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
@@ -201,6 +264,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        studioWeb?.destroy()
         StreamingForegroundService.onStopRequested = null
         if (session.isStreaming) session.stop()
         if (session.isLocalRecording) session.stopLocalRecording()
@@ -374,6 +438,7 @@ class MainActivity : AppCompatActivity() {
                 launch { session.localRecording.collectLatest { renderState() } }
                 launch { session.client.stats.collectLatest { renderStats(it) } }
                 launch { pollReceiverReachability() }
+                launch { pollStudio() }
                 launch {
                     session.events.collectLatest {
                         Snackbar.make(binding.root, it, Snackbar.LENGTH_LONG).show()
@@ -431,10 +496,9 @@ class MainActivity : AppCompatActivity() {
 
         binding.tvReceiverHint.visibility =
             if (state == LinkState.OFF && !localRec && receiverReachable == false) View.VISIBLE else View.GONE
-        binding.tvReceiverHint.text = getString(
-            R.string.no_receiver_hint,
-            settings.serverIp.ifEmpty { getString(R.string.no_server_set) }
-        )
+        binding.tvReceiverHint.text =
+            if (Tailscale.isTailnetHost(settings.serverIp) && !tailscaleUp) getString(R.string.studio_no_tailscale_hint)
+            else getString(R.string.no_receiver_hint, settings.serverIp.ifEmpty { getString(R.string.no_server_set) })
 
         val remote = state == LinkState.ARMED || state == LinkState.RECORDING || state == LinkState.FINISHING
         binding.btnRecord.visibility = if (remote) View.VISIBLE else View.GONE
@@ -463,6 +527,7 @@ class MainActivity : AppCompatActivity() {
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         updateRecOverlay()
         updateModeRow()
+        renderStudioCard()
     }
 
     /**
@@ -641,6 +706,227 @@ class MainActivity : AppCompatActivity() {
         statusExpanded = !statusExpanded
         binding.statusBody.visibility = if (statusExpanded) View.VISIBLE else View.GONE
         binding.statusChevron.text = if (statusExpanded) "▾" else "▸"
+    }
+
+    // ------------------------------------------------------------ Studio mode
+
+    /**
+     * Studio mode = Tailscale is up AND the Studio answers at Server IP, which
+     * must itself be a tailnet address or name. Polled: it changes when the
+     * user toggles Tailscale or the PC starts and stops the Studio.
+     */
+    private suspend fun pollStudio() {
+        while (currentCoroutineContext().isActive) {
+            tailscaleUp = Tailscale.isUp(applicationContext)
+            val up = tailscaleUp && Tailscale.isTailnetHost(settings.serverIp) && studio.isUp()
+            if (up != studioMode) {
+                studioMode = up
+                renderState()
+                if (up) maybeAutoConnect()
+                else if (binding.studioOverlay.visibility == View.VISIBLE) hideStudio()
+            }
+            if (studioMode) {
+                renderStudioCard()              // picks up a WiFi <-> mobile data switch for the data-use line
+                refreshStudioResult()
+            }
+            delay(if (studioMode) 3_000L else 6_000L)
+        }
+    }
+
+    /** No PC-side step: the phone connects to the Studio by itself, once per launch. */
+    private fun maybeAutoConnect() {
+        if (!settings.autoStudio || autoConnectTried) return
+        autoConnectTried = true
+        if (session.state.value == LinkState.OFF && !session.isLocalRecording && has(Manifest.permission.CAMERA)) connect()
+    }
+
+    private fun renderStudioCard() {
+        binding.studioCard.visibility = if (studioMode) View.VISIBLE else View.GONE
+        if (!studioMode) return
+        val state = session.state.value
+        binding.tvStudioState.setText(
+            when (state) {
+                LinkState.ARMED -> R.string.studio_state_ready
+                LinkState.RECORDING -> R.string.studio_state_recording
+                LinkState.FINISHING -> R.string.studio_state_uploading
+                LinkState.CONNECTING -> R.string.studio_state_connecting
+                LinkState.STREAMING -> R.string.studio_state_ready
+                else -> R.string.studio_state_online
+            }
+        )
+        val editable = state != LinkState.RECORDING && state != LinkState.FINISHING
+        binding.chkLive.isEnabled = editable
+        binding.chkEnhance.isEnabled = editable
+        // Off WiFi the frames go over mobile data: say roughly how much.
+        val onWifi = session.isWifiConnected()
+        binding.tvStudioData.visibility = if (onWifi) View.GONE else View.VISIBLE
+        if (!onWifi) {
+            binding.tvStudioData.text = getString(R.string.studio_mobile_data, settings.estimateMbps() * 60 / 8)
+        }
+    }
+
+    /** Start/stop a take through the Studio, with the checkboxes applied. */
+    private fun studioToggleRecording() {
+        val recording = session.state.value == LinkState.RECORDING
+        lifecycleScope.launch {
+            binding.btnRecord.isEnabled = false
+            try {
+                if (recording) {
+                    studio.stopRecording()
+                } else {
+                    studio.setEnhance(binding.chkEnhance.isChecked)
+                    takeSession = studio.startRecording(binding.chkLive.isChecked).ifEmpty { null }
+                    shownResultFor = null
+                }
+            } catch (e: Exception) {
+                Snackbar.make(binding.root, e.message ?: "Studio request failed", Snackbar.LENGTH_LONG).show()
+            } finally {
+                binding.btnRecord.isEnabled = session.state.value != LinkState.FINISHING
+            }
+        }
+    }
+
+    /**
+     * Follows the current take through the Studio: recording, reconstructing
+     * (with the job's own progress line), then done - at which point the result
+     * viewer opens by itself, as the website's View button would.
+     */
+    private suspend fun refreshStudioResult() {
+        val (job, recordingId) = try {
+            studio.poll(takeSession)
+        } catch (_: Exception) {
+            return
+        }
+        if (recordingId != null && takeSession != recordingId) {
+            takeSession = recordingId          // a take started from the website counts too
+            shownResultFor = null
+        }
+        val sid = takeSession
+        val recording = recordingId != null
+        var text: String? = null
+        var fraction = -1.0
+        var done = false
+        when {
+            recording -> text = getString(
+                if (binding.chkLive.isChecked || job?.live == true) R.string.studio_result_recording_live
+                else R.string.studio_result_recording
+            )
+            sid == null -> Unit
+            job == null -> text = getString(R.string.studio_result_saved)
+            else -> when (job.state) {
+                "queued", "running", "cancelling" -> {
+                    text = getString(R.string.studio_result_working, job.detail.ifEmpty { job.state })
+                    fraction = job.fraction
+                }
+                "done" -> { text = getString(R.string.studio_result_done); done = true }
+                "failed" -> text = getString(R.string.studio_result_failed, job.error.ifEmpty { "see the Studio log" })
+                "cancelled" -> text = getString(R.string.studio_result_cancelled)
+            }
+        }
+        binding.tvStudioResult.text = text.orEmpty()
+        binding.tvStudioResult.visibility = if (text == null) View.GONE else View.VISIBLE
+        binding.studioJobProgress.visibility = if (fraction >= 0) View.VISIBLE else View.GONE
+        if (fraction >= 0) binding.studioJobProgress.setProgressCompat((fraction * 100).toInt().coerceIn(0, 100), true)
+        binding.btnOpenResult.visibility = if (done && sid != null) View.VISIBLE else View.GONE
+        if (done && sid != null && shownResultFor != sid && !recording) {
+            shownResultFor = sid
+            showStudio("#/studio/view/$sid")
+        }
+    }
+
+    private fun showStudio(hash: String = "#/studio") {
+        binding.studioOverlay.visibility = View.VISIBLE
+        studioBack.isEnabled = true
+        binding.tvStudioError.visibility = View.GONE
+        lifecycleScope.launch {
+            val token = try {
+                studio.authToken()
+            } catch (e: Exception) {
+                showStudioError(e.message)
+                return@launch
+            }
+            val base = studio.baseUrl
+            // Signs the WebView in with the same session the website's login sets.
+            if (token.isNotEmpty()) CookieManager.getInstance().setCookie(base, "rtvio_auth=$token; Path=/")
+            val web = studioWeb ?: createStudioWebView().also {
+                studioWeb = it
+                binding.studioWebHost.addView(it, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            }
+            if (web.url == null || studioLoadFailed) web.loadUrl("$base/$hash")
+            // replace, not assign: a jump the app makes must not add a Back step
+            else web.evaluateJavascript("location.replace(" + JSONObject.quote(hash) + ")", null)
+        }
+    }
+
+    private fun hideStudio() {
+        binding.studioOverlay.visibility = View.GONE
+        studioBack.isEnabled = false
+    }
+
+    private fun showStudioError(message: String?) {
+        studioLoadFailed = true
+        binding.tvStudioError.text = message ?: getString(R.string.studio_unreachable)
+        binding.tvStudioError.visibility = View.VISIBLE
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun createStudioWebView(): WebView = WebView(this).apply {
+        setBackgroundColor(Color.WHITE)             // the website's Studio page is light
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.mediaPlaybackRequiresUserGesture = false
+        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        CookieManager.getInstance().setAcceptCookie(true)
+        webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                studioLoadFailed = false
+                binding.tvStudioError.visibility = View.GONE
+            }
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (request.isForMainFrame) showStudioError(null)
+            }
+
+            // Links off the Studio (docs, tailscale.com) open in the browser, not in here.
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                if (request.url.host == Uri.parse(studio.baseUrl).host) return false
+                startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                return true
+            }
+        }
+        webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                binding.studioWebProgress.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
+                binding.studioWebProgress.setProgressCompat(newProgress, true)
+            }
+
+            // The website's "Upload video or .zip" button.
+            override fun onShowFileChooser(
+                webView: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams
+            ): Boolean {
+                fileCallback?.onReceiveValue(null)
+                fileCallback = callback
+                return try {
+                    fileChooser.launch(params.createIntent())
+                    true
+                } catch (_: Exception) {
+                    fileCallback = null
+                    callback.onReceiveValue(null)
+                    false
+                }
+            }
+        }
+        // Exports (.zip, .ply) go to Downloads, carrying the WebView's sign-in.
+        setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mime, _ ->
+            val req = DownloadManager.Request(Uri.parse(url))
+                .setMimeType(mime)
+                .addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url).orEmpty())
+                .addRequestHeader("User-Agent", userAgent)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, contentDisposition, mime))
+            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+            Snackbar.make(binding.root, R.string.studio_download_started, Snackbar.LENGTH_SHORT).show()
+        })
     }
 
     private fun View.performHapticFeedbackIfEnabled() {

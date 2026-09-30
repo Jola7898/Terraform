@@ -50,6 +50,7 @@ import csv
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -134,20 +135,62 @@ def confidence_gate(depth_conf_np, percentile=DEPTH_CONF_PERCENTILE):
     return keep, thresh
 
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".webp", ".tif", ".tiff", ".jp2", ".ppm", ".pgm")
+
+
+def _natural_key(s):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s.lower())]
+
+
+class _FrameSource:
+    """Frames in order from a video file or from a folder of images (sorted
+    naturally, so frame2 comes before frame10). A folder has no clock, so it
+    is treated as 30 fps - timings only matter for GPS alignment, which an
+    image folder does not have."""
+
+    def __init__(self, path):
+        self.cap = self.files = None
+        self.i = 0
+        if os.path.isdir(path):
+            names = sorted((f for f in os.listdir(path) if f.lower().endswith(IMAGE_EXTS)), key=_natural_key)
+            if len(names) < 2:
+                raise RuntimeError("need at least 2 images in %s, found %d" % (path, len(names)))
+            self.files = [os.path.join(path, f) for f in names]
+            self.fps = 30.0
+        else:
+            self.cap = cv2.VideoCapture(path)
+            if not self.cap.isOpened():
+                raise RuntimeError("could not open video: %s" % path)
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+
+    def read(self):
+        if self.cap is not None:
+            ok, img = self.cap.read()
+            return img if ok else None
+        while self.i < len(self.files):
+            img = cv2.imread(self.files[self.i])
+            self.i += 1
+            if img is not None:
+                return img
+        return None
+
+    def release(self):
+        if self.cap is not None:
+            self.cap.release()
+
+
 def sample_video_frames(video_path, out_dir, sample_fps=SAMPLE_FPS):
     """Extracts frames to out_dir as JPEGs (quality 95) and returns
     [(frame_path, video_timestamp_s), ...]. sample_fps <= 0 keeps every
     frame of the source."""
     os.makedirs(out_dir, exist_ok=True)
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError("could not open video: %s" % video_path)
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap = _FrameSource(video_path)
+    src_fps = cap.fps
     stride = 1 if not sample_fps or sample_fps <= 0 else max(1, round(src_fps / sample_fps))
     frames, idx, kept = [], 0, 0
     while True:
-        ok, img = cap.read()
-        if not ok:
+        img = cap.read()
+        if img is None:
             break
         if idx % stride == 0:
             path = os.path.join(out_dir, "frame_%06d.jpg" % kept)
@@ -159,6 +202,99 @@ def sample_video_frames(video_path, out_dir, sample_fps=SAMPLE_FPS):
     log("sample_video_frames: %d source frames (%.1f fps) -> %d kept (stride %d)"
         % (idx, src_fps, kept, stride))
     return frames
+
+
+KEYFRAME_MIN_SHIFT = 0.005      # median feature motion (fraction of frame width) that earns a new keyframe
+KEYFRAME_MAX_GAP = 3            # never skip more than this many source frames (0.1 s at 30 fps). Measured on a
+                                # 1033-frame clip: 6 -> 173 frames / 79 s, 3 -> 346 frames / 102 s with visibly
+                                # denser, more continuous surfaces (more views averaged per point)
+KEYFRAME_MIN_SURVIVAL = 0.6     # ...or the fraction of tracked features still visible falling below this
+
+
+def sample_video_keyframes(video_path, out_dir, min_shift=KEYFRAME_MIN_SHIFT, min_survival=KEYFRAME_MIN_SURVIVAL,
+                           max_gap=KEYFRAME_MAX_GAP):
+    """Motion-adaptive frame selection: extracts a frame only when the drone
+    has actually moved enough since the last one, instead of every 1/30 s.
+    Motion is measured on the images themselves (Lucas-Kanade tracking of
+    corner features from the last keyframe, median displacement over frame
+    width), so it follows how the drone really flew:
+      - hovering or crawling: near-duplicate frames are dropped - they add
+        cost and almost no baseline, and tiny baselines are where depth and
+        pose are noisiest;
+      - fast straight flight: a keyframe every few frames;
+      - a tight curve or a fast turn: the view sweeps quickly, features
+        vanish quickly, and keyframes come densely enough to keep every
+        neighbouring pair overlapping - the previous frame is taken as the
+        keyframe if the current one would already have lost the overlap.
+    Returns [(frame_path, video_timestamp_s), ...] like sample_video_frames."""
+    os.makedirs(out_dir, exist_ok=True)
+    cap = _FrameSource(video_path)
+    src_fps = cap.fps
+    lk = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
+
+    def small(img):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        s = 320.0 / g.shape[1]
+        return cv2.resize(g, (320, max(1, round(g.shape[0] * s))), interpolation=cv2.INTER_AREA)
+
+    def features(g):
+        return cv2.goodFeaturesToTrack(g, 300, 0.01, 8)
+
+    frames, kept, idx = [], 0, 0
+
+    def keep(img, i):
+        nonlocal kept
+        path = os.path.join(out_dir, "frame_%06d.jpg" % kept)
+        cv2.imwrite(path, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        frames.append((path, i / src_fps))
+        kept += 1
+
+    def motion(kf_gray, kf_pts, gray):
+        """(median displacement / width, surviving fraction) of kf's features in `gray`."""
+        if kf_pts is None or len(kf_pts) < 8:
+            return 1.0, 0.0                      # nothing to track (blank/blurred frame): treat as a big change
+        nxt, st, _e = cv2.calcOpticalFlowPyrLK(kf_gray, gray, kf_pts, None, **lk)
+        ok = st.ravel() == 1
+        if ok.sum() < 8:
+            return 1.0, ok.sum() / len(kf_pts)
+        d = np.linalg.norm((nxt[ok] - kf_pts[ok]).reshape(-1, 2), axis=1)
+        return float(np.median(d)) / gray.shape[1], ok.sum() / len(kf_pts)
+
+    kf_gray = kf_pts = None
+    prev_img = prev_gray = None
+    prev_idx = -1
+    while True:
+        img = cap.read()
+        if img is None:
+            break
+        gray = small(img)
+        if kf_gray is None:
+            keep(img, idx)
+            kf_gray, kf_pts = gray, features(gray)
+        else:
+            shift, alive = motion(kf_gray, kf_pts, gray)
+            if alive < min_survival and prev_idx > frames_last_src(frames, src_fps):
+                # Overlap with the keyframe is about to be lost: the last frame that
+                # still had it becomes the keyframe, and this frame is judged against it.
+                keep(prev_img, prev_idx)
+                kf_gray, kf_pts = prev_gray, features(prev_gray)
+                shift, alive = motion(kf_gray, kf_pts, gray)
+            if shift >= min_shift or alive < min_survival or idx - frames_last_src(frames, src_fps) >= max_gap:
+                # max_gap: forward flight moves the image centre very little (the median
+                # feature shift under-reads it), so time is capped independently of shift.
+                keep(img, idx)
+                kf_gray, kf_pts = gray, features(gray)
+        prev_img, prev_gray, prev_idx = img, gray, idx
+        idx += 1
+    cap.release()
+    log("sample_video_keyframes: %d source frames (%.1f fps) -> %d motion-selected keyframes "
+        "(one per %.1f%% of frame width moved)" % (idx, src_fps, kept, 100 * min_shift))
+    return frames
+
+
+def frames_last_src(frames, src_fps):
+    """Source-frame index of the last kept frame."""
+    return int(round(frames[-1][1] * src_fps)) if frames else -1
 
 
 def load_gps_track(path):
@@ -228,7 +364,20 @@ def _load_recording_frames(session_dir):
 
 # ---------------------------------------------------------------- model --
 
+_MODEL_CACHE = {}
+
+
 def _load_vggt(device):
+    """(model, dtype), loaded once per process and kept: the persistent
+    worker (vggt_worker.py) runs many reconstructions in one process, and
+    reloading a 5 GB checkpoint for each is most of a short job's wall time.
+    A one-shot command-line run just loads it once, as before."""
+    if device not in _MODEL_CACHE:
+        _MODEL_CACHE[device] = _load_vggt_uncached(device)
+    return _MODEL_CACHE[device]
+
+
+def _load_vggt_uncached(device):
     """VGGT-1B with only the camera and depth heads (the point and track
     heads are ~98M params this pipeline never calls), from a local checkpoint
     (RTVIO_VGGT_CHECKPOINT or data/models/vggt1b_model.pt) via mmap - a plain
@@ -274,6 +423,24 @@ def _load_vggt(device):
     return model, dtype
 
 
+def _fast_attention(device):
+    """Prefer cuDNN's fused attention, then the memory-efficient kernel.
+    The default dispatch on this PyTorch (Windows CUDA wheel) has no flash
+    attention and leaves cuDNN "runtime disabled", so it lands on the
+    memory-efficient kernel - measured on an RTX 5070 Ti at 46 TFLOPs for
+    VGGT's global attention (64 frames x 777 tokens) against 95 TFLOPs with
+    cuDNN, and attention is ~90%% of a window's time. If cuDNN cannot take a
+    shape, torch falls through to the next backend in the list."""
+    import contextlib
+    if device != "cuda":
+        return contextlib.nullcontext()
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION], set_priority=True)
+    except (ImportError, AttributeError, TypeError):
+        return contextlib.nullcontext()
+
+
 def _vggt_forward(model, imgs, device, dtype):
     """imgs (S,3,H,W) float in [0,1] on device -> cam-from-world extrinsics
     (S,3,4), intrinsics (S,3,3), depth (S,H,W), confidence (S,H,W), float32."""
@@ -282,7 +449,7 @@ def _vggt_forward(model, imgs, device, dtype):
     x = imgs[None]
     autocast = device == "cuda" and dtype != torch.float32
     with torch.no_grad():
-        with torch.autocast(device_type=device, dtype=dtype, enabled=autocast):
+        with torch.autocast(device_type=device, dtype=dtype, enabled=autocast), _fast_attention(device):
             toks, ps = model.aggregator(x)
         heads_autocast = autocast and dtype == torch.bfloat16 and HEADS_IN_BF16
         if not heads_autocast:
@@ -306,14 +473,50 @@ def auto_window_frames(tokens_per_frame, pixels_per_frame, free_mb):
 
 # --------------------------------------------------------------- frames --
 
+def tone_lut(paths, n=20):
+    """ONE contrast curve for the whole video: a percentile stretch measured
+    on up to n evenly spaced frames. The same curve goes on every frame -
+    an adaptive per-frame filter (CLAHE, per-frame auto-levels) would change
+    the same wall's brightness and texture from frame to frame, and VGGT
+    matches appearance between frames, so that shows up as ghosted or
+    doubled objects."""
+    idx = np.linspace(0, len(paths) - 1, min(n, len(paths))).astype(int)
+    grays = []
+    for i in idx:
+        g = cv2.imread(paths[i], cv2.IMREAD_GRAYSCALE)
+        if g is not None:
+            grays.append(g[::4, ::4].ravel())
+    if not grays:
+        return None
+    lo, hi = np.percentile(np.concatenate(grays), (1, 99))
+    lo, hi = min(float(lo), 50.0), max(float(hi), 200.0)         # never a violent stretch
+    return np.clip((np.arange(256) - lo) * 255.0 / (hi - lo), 0, 255).astype(np.uint8)
+
+
+def enhance_small(img, lut):
+    """Detail recovery on the frame at the size VGGT actually sees (~518 px
+    wide), not at the source size - about a tenth of the pixels, so it costs
+    almost nothing. Everything here is a fixed per-pixel filter that behaves
+    the same on every frame: the shared tone curve, a light edge-preserving
+    smooth for sensor/codec noise, and a mild unsharp mask."""
+    if lut is not None:
+        img = cv2.LUT(img, lut)
+    img = cv2.bilateralFilter(img, 5, 20, 3)
+    soft = cv2.GaussianBlur(img, (0, 0), 1.0)
+    return cv2.addWeighted(img, 1.3, soft, -0.3, 0)
+
+
 class FrameLoader:
     """Decodes, rotates and resizes frames to VGGT's input on a thread pool,
     ahead of the GPU. Resizing with INTER_AREA (an averaging filter) rather
     than VGGT's PIL bicubic: a 720/1080 px frame is being shrunk ~1.4-2x
     and area averaging is the alias-free way to do that."""
 
-    def __init__(self, paths, workers=8, masker=None, camera=None, undistort_balance=0.0):
+    def __init__(self, paths, workers=8, masker=None, camera=None, undistort_balance=0.0, enhance=False,
+                 size=VGGT_SIZE):
         self.paths = paths
+        self.enhance = enhance
+        self.tone = tone_lut(paths) if enhance else None
         self.masker = masker
         self._mask_lock = threading.Lock()
         self.pool = ThreadPoolExecutor(max_workers=workers)
@@ -347,16 +550,18 @@ class FrameLoader:
                 }
         self.rotated = h0 > w0
         rh, rw = (w0, h0) if self.rotated else (h0, w0)
-        self.W = VGGT_SIZE
-        self.H_resized = int(round(rh * VGGT_SIZE / rw / 14.0) * 14)
-        self.H = min(self.H_resized, VGGT_SIZE)
+        size = max(14, int(round(size / 14.0)) * 14)      # VGGT patches are 14 px
+        self.W = size
+        self.H_resized = int(round(rh * size / rw / 14.0) * 14)
+        self.H = min(self.H_resized, size)
 
     def _load(self, i):
         img = cv2.imread(self.paths[i], cv2.IMREAD_COLOR)
         if img is None:
             raise RuntimeError("cannot read %s" % self.paths[i])
         if self.undistort is not None:
-            img = cv2.remap(img, self.undistort[0], self.undistort[1], cv2.INTER_LINEAR)
+            img = cv2.remap(img, self.undistort[0], self.undistort[1],
+                            cv2.INTER_CUBIC if self.enhance else cv2.INTER_LINEAR)
         self.blur[i] = float(sharpness_score(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)))
         if self.rotated:
             img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
@@ -365,6 +570,8 @@ class FrameLoader:
             with self._mask_lock:                       # ultralytics predictors are not thread-safe
                 static = self.masker.get_static_mask(img)
         img = cv2.resize(img, (self.W, self.H_resized), interpolation=cv2.INTER_AREA)
+        if self.enhance:
+            img = enhance_small(img, self.tone)
         top = (self.H_resized - self.H) // 2
         img = img[top:top + self.H]
         rgb = np.ascontiguousarray(img[:, :, ::-1])
@@ -423,17 +630,31 @@ class Progress:
 # ------------------------------------------------------------ the core --
 
 def reconstruct(video_path, gps_path, out_dir, sample_fps=SAMPLE_FPS, progress_path=None, **opts):
-    """Video file (+ optional GPS CSV) -> reconstruction. See reconstruct_frames."""
+    """Video file, or a folder of image frames, (+ optional GPS CSV) -> reconstruction. See reconstruct_frames."""
     os.makedirs(out_dir, exist_ok=True)
     progress = Progress(progress_path)
     progress.update(stage="frames", detail="extracting video frames", fraction=0.0)
-    frames = sample_video_frames(video_path, os.path.join(out_dir, "frames"), sample_fps=sample_fps)
+    frames = None
+    if opts.pop("keyframes", False) and not sample_fps:
+        frames = sample_video_keyframes(video_path, os.path.join(out_dir, "frames"),
+                                        min_shift=opts.pop("keyframe_shift", None) or KEYFRAME_MIN_SHIFT,
+                                        max_gap=opts.pop("keyframe_gap", None) or KEYFRAME_MAX_GAP)
+        if len(frames) < 2:
+            log("WARNING: motion selection kept fewer than 2 frames (a nearly static video?) - using every frame")
+            frames = None
+    opts.pop("keyframe_shift", None)
+    opts.pop("keyframe_gap", None)
+    if frames is None:
+        frames = sample_video_frames(video_path, os.path.join(out_dir, "frames"), sample_fps=sample_fps)
     if len(frames) < 2:
         raise RuntimeError("need at least 2 sampled frames, got %d" % len(frames))
     gps_track = load_gps_track(gps_path) if gps_path else []
     if gps_path and opts.get("gps_mode") is None:
         opts["gps_mode"] = "global"
     opts["camera"] = _lens_profile(opts.pop("intrinsics", None), opts.pop("undistort", True))
+    fisheye_fov = opts.pop("fisheye_fov", None)
+    if fisheye_fov and opts["camera"] is None:
+        opts["camera"] = _assumed_fisheye(frames[0][0], *fisheye_fov)
     return reconstruct_frames([p for p, _ in frames], [t for _, t in frames], gps_track,
                               out_dir, progress=progress, **opts)
 
@@ -456,8 +677,37 @@ def reconstruct_from_recording(session_dir, out_dir, progress_path=None, **opts)
     # its camera was calibrated); --intrinsics only for one that has none.
     opts["camera"] = _lens_profile(os.path.join(session_dir, "camera_intrinsics.json"),
                                    opts.pop("undistort", True), fallback=opts.pop("intrinsics", None))
+    # main() passes the video-only options to every mode. A recording has already been
+    # sampled by its phone/drone, so frame selection does not apply (a stray `keyframes`
+    # here crashed every phone reconstruction with "unexpected keyword argument"); an
+    # assumed fisheye lens still does if one was asked for and there is no calibration.
+    for video_only in ("keyframes", "keyframe_shift", "keyframe_gap"):
+        opts.pop(video_only, None)
+    fisheye_fov = opts.pop("fisheye_fov", None)
+    if fisheye_fov and opts["camera"] is None:
+        opts["camera"] = _assumed_fisheye(frame_paths[0], *fisheye_fov)
     return reconstruct_frames(frame_paths, frame_times, gps_track, out_dir,
                               progress=Progress(progress_path), **opts)
+
+
+def _assumed_fisheye(frame_path, hfov, vfov=None):
+    """Equidistant fisheye profile from a lens's spec-sheet field of view
+    (hfov x vfov degrees), sized to the extracted frames. Focal length comes
+    from the horizontal FOV with square pixels; the vertical FOV is then a
+    consequence of the frame's aspect, and a mismatch with the stated one is
+    logged rather than forced (forcing it would make the pixels non-square)."""
+    img = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError("cannot read %s" % frame_path)
+    h, w = img.shape[:2]
+    prof = camera_model.fisheye_from_fov(w, h, hfov)
+    got = camera_model.fov_deg(prof)
+    log("fisheye correction: assumed equidistant lens, %.0f deg horizontal -> %.0f deg vertical for %dx%d frames"
+        % (got[0], got[1], w, h))
+    if vfov and abs(got[1] - vfov) > 5:
+        log("WARNING: stated vertical FOV is %.0f deg but these frames' aspect implies %.0f deg - "
+            "check the horizontal FOV and that the video is uncropped" % (vfov, got[1]))
+    return prof
 
 
 def _lens_profile(path, undistort=True, fallback=None):
@@ -708,6 +958,7 @@ def _finalize_and_write(state, frame_paths, frame_times, loader, out_dir, progre
                                                               trim_dist=trim, log=log)
             write_ply_mesh(os.path.join(out_dir, "mesh_poisson.ply"), verts, faces, cols=vcols, normals=vn)
             log("mesh_poisson.ply written: %d vertices, %d faces" % (len(verts), len(faces)))
+            _write_preview_mesh(out_dir, pts, nrm, cols, extent, vox_out, poisson_depth)
             if extras:
                 _write_mesh_extras(out_dir, verts, faces, vcols)
         except Exception as e:                                     # noqa: BLE001
@@ -745,7 +996,8 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
                        poisson_depth=10, make_mesh=True, gps_mode=None,
                        ref_lat=None, ref_lon=None, ref_alt=None,
                        use_masking=False, masking_preset="coco", extras=False,
-                       cell_size_m=1.0, viz=None, camera=None, undistort_balance=0.0):
+                       cell_size_m=1.0, viz=None, camera=None, undistort_balance=0.0, enhance=False,
+                       vggt_size=VGGT_SIZE):
     import torch
 
     progress = progress or Progress(None)
@@ -778,7 +1030,11 @@ def reconstruct_frames(frame_paths, frame_times, gps_track, out_dir, progress=No
     if use_masking:
         from .ai_masking import DynamicMasker
         masker = DynamicMasker.for_nadir_aerial() if masking_preset == "nadir_aerial" else DynamicMasker()
-    loader = FrameLoader(frame_paths, masker=masker, camera=camera, undistort_balance=undistort_balance)
+    loader = FrameLoader(frame_paths, masker=masker, camera=camera, undistort_balance=undistort_balance,
+                         enhance=enhance, size=vggt_size)
+    if enhance:
+        log("image enhancement on: one shared tone curve + light denoise + mild sharpen, "
+            "same on every frame")
     tokens = (loader.H // 14) * (loader.W // 14)
     log("input: %d frames %dx%d%s -> VGGT %dx%d (%d tokens/frame)"
         % (n, loader.src_size[0], loader.src_size[1],
@@ -928,6 +1184,29 @@ def _write_cameras_json(out_dir, frame_ids, frame_times, cam_R, cam_C, poses, fr
                         "K": np.round(poses[i][2], 3).tolist()}
                        for j, i in enumerate(frame_ids)],
         }, f)
+
+
+PREVIEW_DEPTH = 8
+
+
+def _write_preview_mesh(out_dir, pts, nrm, cols, extent, vox_out, full_depth):
+    """mesh_preview.ply: the same cloud at Poisson depth 8 - about 150 K faces and
+    ~4 MB where depth 10 is ~10 M faces and ~270 MB, for about 4 s of extra work. The
+    Studio's viewer and the live-watch window open this first (and on a phone or a
+    tunnel it is the difference between seconds and minutes); the full mesh is one
+    click away. Skipped when the main mesh is already that small."""
+    if full_depth <= PREVIEW_DEPTH + 1:
+        return
+    from .surface import poisson_mesh, write_ply_mesh
+    try:
+        cell = 1.1 * extent / (2 ** PREVIEW_DEPTH)
+        trim = max(3.0 * vox_out, 2.0 * cell)
+        verts, faces, vcols, vn, _info = poisson_mesh(pts, nrm, cols, depth=PREVIEW_DEPTH, trim_dist=trim,
+                                                      log=lambda _m: None)
+        write_ply_mesh(os.path.join(out_dir, "mesh_preview.ply"), verts, faces, cols=vcols, normals=vn)
+        log("mesh_preview.ply written: %d vertices, %d faces (quick look)" % (len(verts), len(faces)))
+    except Exception as e:                                         # noqa: BLE001 - the preview is optional
+        log("WARNING: preview mesh skipped (%s: %s)" % (type(e).__name__, e))
 
 
 def _write_mesh_extras(out_dir, verts, faces, vcols):
@@ -1122,7 +1401,7 @@ def _write_trajectory_plot(out_dir, cam_C, georeferenced):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--video", help="video file")
+    src.add_argument("--video", help="video file, or a folder of image frames (sorted by name)")
     src.add_argument("--from-recording", metavar="DIR", help="a recorded session directory "
                      "(rtvio.studio or live_pipeline --record-only)")
     ap.add_argument("--out", required=True, help="output directory")
@@ -1154,6 +1433,26 @@ def main():
     ap.add_argument("--intrinsics", default=None, metavar="JSON",
                     help="lens calibration (camera_model profile, e.g. data/drone_camera.json) to undistort "
                          "frames with: for --video, or a recording without its own camera_intrinsics.json")
+    ap.add_argument("--fisheye-fov", type=float, nargs="+", metavar="DEG",
+                    help="--video only, no calibration file: assume an equidistant fisheye lens with this "
+                         "horizontal [and optional vertical] field of view in degrees (a drone spec, e.g. "
+                         "124 60) and undistort every frame before VGGT. Ignored if --intrinsics applies")
+    ap.add_argument("--vggt-size", type=int, default=VGGT_SIZE, metavar="PX",
+                    help="width VGGT sees each frame at (default %d, its training size). NOT recommended above "
+                         "it: 700 was 2.4x slower and visibly noisier/more distorted on a test clip" % VGGT_SIZE)
+    ap.add_argument("--keyframes", action="store_true",
+                    help="--video only: instead of every frame, keep one whenever the drone has moved "
+                         "enough (measured from the images) - fewer, better-spaced views: faster and "
+                         "less noisy depth/pose")
+    ap.add_argument("--keyframe-shift", type=float, default=None, metavar="FRAC",
+                    help="--keyframes: median feature motion, as a fraction of frame width, that starts a "
+                         "new keyframe (default %.3f; smaller = more frames)" % KEYFRAME_MIN_SHIFT)
+    ap.add_argument("--keyframe-gap", type=int, default=None, metavar="N",
+                    help="--keyframes: never skip more than N source frames (default %d; smaller = more "
+                         "frames, more averaging per surface, slower)" % KEYFRAME_MAX_GAP)
+    ap.add_argument("--enhance", action="store_true",
+                    help="low-resolution drone video: apply one shared contrast curve, a light denoise "
+                         "and a mild sharpen to every frame, identically, before VGGT")
     ap.add_argument("--no-undistort", action="store_true",
                     help="feed frames to VGGT as recorded even if a lens calibration is available")
     ap.add_argument("--undistort-balance", type=float, default=0.0,
@@ -1182,7 +1481,11 @@ def main():
                 use_masking=args.masking and not args.no_masking, masking_preset=args.masking_preset,
                 extras=args.extras, cell_size_m=args.cell_size_m,
                 intrinsics=args.intrinsics, undistort=not args.no_undistort,
-                undistort_balance=args.undistort_balance)
+                fisheye_fov=args.fisheye_fov if not args.no_undistort else None,
+                undistort_balance=args.undistort_balance, enhance=args.enhance,
+                keyframes=args.keyframes, keyframe_shift=args.keyframe_shift,
+                keyframe_gap=args.keyframe_gap,
+                vggt_size=args.vggt_size)
     progress = Progress(args.progress)
 
     viz = None
@@ -1222,6 +1525,8 @@ def main():
             except KeyboardInterrupt:
                 pass
         if viz is not None:
+            if args.no_viz_hold:
+                viz.wait_final()
             viz.stop()
 
 

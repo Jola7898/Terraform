@@ -30,3 +30,7 @@ abc.mp4
 def.mp4
 ghi.mp4
 deploy/vercel/dist/
+
+# Runtime reconstruction data
+rtvio/data/uploads/
+rtvio/data/*.log

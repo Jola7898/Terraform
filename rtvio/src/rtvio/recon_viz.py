@@ -54,6 +54,8 @@ PAGE = """<!doctype html>
   .btn{background:#171b21;border:1px solid #2a3038;color:#cfd8e3;border-radius:6px;padding:6px 10px;
        font-size:10px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer}
   .btn:hover{border-color:#3d4553}
+  .rot{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:#7d8794;display:flex;align-items:center;gap:4px}
+  .rot input{width:90px}
   .btn.on{background:#7fa84a;border-color:#7fa84a;color:#0b0d10}
   #cam{position:fixed;top:52px;right:12px;width:260px;border:1px solid #2a3038;border-radius:8px;
        background:#000;z-index:2;box-shadow:0 4px 18px rgba(0,0,0,.5)}
@@ -71,19 +73,37 @@ PAGE = """<!doctype html>
   #status{position:fixed;bottom:150px;left:12px;color:#7d8794;font-size:10px;z-index:2}
   #status .live{color:#4ed07a}
   #hint{position:fixed;bottom:150px;right:12px;color:#4a5361;font-size:10px;z-index:2}
-</style></head>
+  html[data-theme=light],html[data-theme=light] body{background:#ffffff;color:#1b2430}
+  html[data-theme=light] #top{background:linear-gradient(rgba(255,255,255,.95),rgba(255,255,255,0))}
+  html[data-theme=light] #kicker{color:#3a6fc4}
+  html[data-theme=light] #sub,html[data-theme=light] #status,html[data-theme=light] .rot,html[data-theme=light] .stat span,html[data-theme=light] #capture h3{color:#647184}
+  html[data-theme=light] #hint{color:#8a96a6}
+  html[data-theme=light] .btn{background:#f4f6f9;border-color:#dbe1e9;color:#1b2430}
+  html[data-theme=light] .btn.on{background:#3a6fc4;border-color:#3a6fc4;color:#fff}
+  html[data-theme=light] #capture{background:rgba(255,255,255,.9);border-top-color:#dbe1e9}
+  html[data-theme=light] .stat b{color:#1b2430}
+  html[data-theme=light] #cam{border-color:#dbe1e9;box-shadow:0 4px 18px rgba(20,30,50,.15)}
+</style>
+<script>document.documentElement.dataset.theme="dark";</script>
+</head>
 <body>
 <div id="top">
   <div><div id="kicker">RTVIO &middot; VGGT RECONSTRUCTION</div><div id="title">-</div></div>
   <button class="btn" id="btnWire">Wireframe</button>
   <button class="btn" id="btnRotate">Auto-rotate</button>
   <button class="btn" id="btnReset">Reset view</button>
+  <a class="btn" id="btnBack" href="/#/studio" style="display:none;text-decoration:none">&larr; Studio</a>
+  <button class="btn" id="btnFlip">Flip upside-down</button>
+  <label class="rot">tilt <input type="range" id="rotX" min="0" max="360" step="1" value="180"></label>
+  <label class="rot">turn <input type="range" id="rotY" min="0" max="360" step="1" value="0"></label>
+  <label class="rot">roll <input type="range" id="rotZ" min="0" max="360" step="1" value="0"></label>
+  <button class="btn" id="btnRotReset">Default rotation</button>
   <div id="sub"></div>
 </div>
 <img id="cam" alt="">
 <div id="banner"></div>
 <div id="status">connecting...</div>
-<div id="hint">drag orbit &middot; scroll zoom &middot; right-drag pan</div>
+<div id="hint">drag rotate any direction &middot; Alt-drag or Q/E roll &middot; right-drag pan &middot; scroll zoom</div>
 <div id="capture">
   <h3>Capture</h3>
   <div id="grid"></div>
@@ -95,7 +115,13 @@ PAGE = """<!doctype html>
 document.getElementById('title').textContent = __TITLE__;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b0d10);
+const isLight = () => false;   // the live view is always dark
+scene.background = new THREE.Color(isLight() ? 0xffffff : 0x0b0d10);
+window.addEventListener('storage', (e) => {
+  return;   // theme is fixed (dark); nothing to follow
+  document.documentElement.dataset.theme = e.newValue || '';
+  scene.background = new THREE.Color(isLight() ? 0xffffff : 0x0b0d10);
+});
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 1e6);
 camera.position.set(6, 6, 6);
 const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -103,6 +129,7 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.setPixelRatio(devicePixelRatio);
 document.body.appendChild(renderer.domElement);
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableRotate = false;   // left-drag rotates the model freely instead (attachFreeRotate below)
 scene.add(new THREE.AmbientLight(0xffffff, 0.7));
 const sun = new THREE.DirectionalLight(0xffffff, 0.7);
 sun.position.set(1, 2, 1);
@@ -122,7 +149,11 @@ function rebuildGeom(){
 rebuildGeom();
 const cloudMat = new THREE.PointsMaterial({size:0.035, vertexColors:true});
 let current = new THREE.Points(geom, cloudMat);
-scene.add(current);
+// Everything that is the model lives in `pivot`, so the rotation controls
+// turn the whole reconstruction about its own centre.
+const pivot = new THREE.Group();
+scene.add(pivot);
+pivot.add(current);
 let haveFinal = false;   // true once the finished mesh/cloud has replaced the live preview
 
 function ensureCapacity(extra){
@@ -228,27 +259,124 @@ function loadFinal(){
   const loader = new THREE.PLYLoader();
   loader.load('mesh.ply' + location.search, (g) => {
     g.computeVertexNormals();
-    scene.remove(current);
+    pivot.remove(current);
     const hasColor = !!g.getAttribute('color');
     const mat = g.index ?
       new THREE.MeshStandardMaterial({vertexColors: hasColor, color: hasColor ? 0xffffff : 0x8fa0b3, side: THREE.DoubleSide}) :
       new THREE.PointsMaterial({size:0.035, vertexColors: hasColor});
     current = g.index ? new THREE.Mesh(g, mat) : new THREE.Points(g, mat);
     current.material.wireframe = wireOn;
-    scene.add(current);
+    centrePivot(current);
     haveFinal = true;
     frameCamera(current);
   }, undefined, () => {
     // no mesh (meshing skipped/failed) - fall back to the finished cloud
     loader.load('cloud.ply' + location.search, (g) => {
-      scene.remove(current);
+      pivot.remove(current);
       current = new THREE.Points(g, new THREE.PointsMaterial({size:0.035, vertexColors: !!g.getAttribute('color')}));
-      scene.add(current);
+      centrePivot(current);
       haveFinal = true;
       frameCamera(current);
-    }, undefined, () => {});
+    }, undefined, () => {
+      // The server may still be writing the files, or the connection blipped: try again.
+      if (++finalTries < 6) setTimeout(loadFinal, 1500);
+    });
   });
 }
+let finalTries = 0;
+
+// Puts `obj`'s bounding-box centre at the pivot's origin so rotating the
+// pivot spins the model about its middle rather than about the world origin.
+function centrePivot(obj){
+  obj.geometry.computeBoundingBox();
+  const c = obj.geometry.boundingBox.getCenter(new THREE.Vector3());
+  obj.position.copy(c).negate();
+  pivot.position.copy(c);
+  pivot.add(obj);
+}
+
+
+// Free rotation: dragging with the left button turns the MODEL about the screen's own axes, so it
+// can go over the top and all the way round in any direction (OrbitControls stops at the poles).
+// Right-drag / Shift-drag still pans and the wheel still zooms - those stay with OrbitControls.
+function attachFreeRotate(el, camera, getObj, onChange, onEnd, isActive) {
+  const pts = new Map();                       // active pointers: id -> {x, y}
+  let mode = "tumble";                         // "tumble" (left-drag) or "roll" (Alt-drag)
+  let lastTwist = null;
+  const axis = (x, y, z) => new THREE.Vector3(x, y, z).applyQuaternion(camera.quaternion);
+  const turn = (a, angle) => getObj().quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(a, angle));
+  const k = () => (Math.PI * 2) / Math.max(el.clientHeight, 320);       // about one full turn per view height
+  el.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;                          // right / middle: OrbitControls pans, zooms
+    if (e.pointerType === "mouse" && (e.shiftKey || e.ctrlKey || e.metaKey)) return;  // Shift / Ctrl + drag: OrbitControls pans
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+    mode = e.altKey ? "roll" : "tumble";
+    lastTwist = null;
+  });
+  el.addEventListener("pointermove", (e) => {
+    const p = pts.get(e.pointerId);
+    if (!p) return;
+    if (e.pointerType === "mouse" && e.buttons === 0) { pts.clear(); onEnd(); return; }   // the release was missed: do not stay stuck
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pts.size >= 2) {                                        // two fingers: a twist rolls the model
+      const [a, b] = [...pts.values()];
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      if (lastTwist !== null) {
+        let d = ang - lastTwist;
+        if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;
+        turn(axis(0, 0, -1), d);
+        onChange();
+      }
+      lastTwist = ang;
+      return;
+    }
+    if (mode === "roll") turn(axis(0, 0, -1), dx * k());        // Alt-drag: turn about the line of sight
+    else { turn(axis(0, 1, 0), dx * k()); turn(axis(1, 0, 0), dy * k()); }   // drag: tumble about the screen's own axes
+    onChange();
+  });
+  const end = (e) => { if (pts.delete(e.pointerId)) { lastTwist = null; if (!pts.size) onEnd(); } };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+  el.addEventListener("lostpointercapture", end);
+  // Q / E roll from the keyboard (not while typing in a field)
+  window.addEventListener("keydown", (e) => {
+    if ((isActive && !isActive()) || /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || "")) return;
+    if (e.key === "q" || e.key === "Q") { turn(axis(0, 0, -1), 0.08); onChange(); onEnd(); }
+    else if (e.key === "e" || e.key === "E") { turn(axis(0, 0, -1), -0.08); onChange(); onEnd(); }
+  });
+}
+// Opened as its own page under the Studio's /viz/ (not embedded in it): offer a way back.
+if (window.top === window && location.pathname.indexOf('/viz') === 0) document.getElementById('btnBack').style.display = '';
+attachFreeRotate(renderer.domElement, camera, () => pivot,
+  () => {
+    const e = new THREE.Euler().setFromQuaternion(pivot.quaternion, 'YXZ');
+    const deg = (r) => Math.round(((THREE.MathUtils.radToDeg(r) % 360) + 360) % 360);
+    rotEls.x.value = deg(e.x); rotEls.y.value = deg(e.y); rotEls.z.value = deg(e.z);
+  },
+  () => { try { localStorage.setItem('rtvioRot2', JSON.stringify([rotEls.x.value, rotEls.y.value, rotEls.z.value])); } catch (e) {} });
+
+// ---- rotation: 0-360 deg about each axis, remembered across reconstructions
+// (the whole point is fixing a model that comes out upside down, and that
+// applies to every run, so the choice is kept in this browser).
+const rotEls = {x: document.getElementById('rotX'), y: document.getElementById('rotY'), z: document.getElementById('rotZ')};
+function applyRot(){
+  pivot.rotation.set(THREE.MathUtils.degToRad(+rotEls.x.value), THREE.MathUtils.degToRad(+rotEls.y.value),
+                     THREE.MathUtils.degToRad(+rotEls.z.value), 'YXZ');
+  try { localStorage.setItem('rtvioRot2', JSON.stringify([rotEls.x.value, rotEls.y.value, rotEls.z.value])); } catch (e) {}
+}
+// Default is flipped 180 deg about X: reconstructions come out upside down.
+const DEFAULT_ROT = [180, 0, 0];
+[rotEls.x.value, rotEls.y.value, rotEls.z.value] = DEFAULT_ROT;
+try {
+  const saved = JSON.parse(localStorage.getItem('rtvioRot2') || 'null');
+  if (saved) { rotEls.x.value = saved[0]; rotEls.y.value = saved[1]; rotEls.z.value = saved[2]; }
+} catch (e) {}
+Object.values(rotEls).forEach((el) => el.addEventListener('input', applyRot));
+document.getElementById('btnFlip').onclick = () => { rotEls.x.value = (+rotEls.x.value + 180) % 360; applyRot(); };
+document.getElementById('btnRotReset').onclick = () => { [rotEls.x.value, rotEls.y.value, rotEls.z.value] = DEFAULT_ROT; applyRot(); };
+applyRot();
 
 // ---- SSE
 const statusEl = document.getElementById('status');
@@ -298,6 +426,11 @@ class _Client:
                 pass
 
 
+class _Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class ReconViz:
     """Owns the HTTP/SSE server for one reconstruction run. `out_dir` is
     where cloud_raw.ply / mesh_poisson.ply will land once the run finishes -
@@ -311,6 +444,7 @@ class ReconViz:
         self._clients = []
         self._lock = threading.Lock()
         self._origin = None
+        self._final_served = threading.Event()   # a browser has fetched the finished mesh/cloud
         self._httpd = None
         self._thread = None
 
@@ -338,6 +472,8 @@ class ReconViz:
                 self.end_headers()
                 with open(path, "rb") as f:
                     self.wfile.write(f.read())
+                if name in ("mesh_poisson.ply", "mesh_preview.ply", "cloud_raw.ply"):
+                    viz._final_served.set()
 
             def do_GET(self):
                 self.path = self.path.split("?", 1)[0]    # the page forwards its query string
@@ -349,7 +485,10 @@ class ReconViz:
                     self.wfile.write(page)
                     return
                 if self.path == "/mesh.ply":
-                    return self._file("mesh_poisson.ply", "application/octet-stream")
+                    # the small preview when the run wrote one (see vggt_reconstruct._write_preview_mesh)
+                    name = "mesh_preview.ply" if os.path.exists(os.path.join(viz.out_dir, "mesh_preview.ply")) \
+                        else "mesh_poisson.ply"
+                    return self._file(name, "application/octet-stream")
                 if self.path == "/cloud.ply":
                     return self._file("cloud_raw.ply", "application/octet-stream")
                 if self.path == "/events":
@@ -363,6 +502,8 @@ class ReconViz:
                     try:
                         while True:
                             msg = client.q.get()
+                            if msg is None:                 # viewer is shutting down
+                                break
                             self.wfile.write(("data: %s\n\n" % msg).encode("utf-8"))
                             self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
@@ -375,8 +516,7 @@ class ReconViz:
                 self.send_response(404)
                 self.end_headers()
 
-        self._httpd = socketserver.ThreadingTCPServer(("0.0.0.0", self.port), Handler)
-        self._httpd.daemon_threads = True
+        self._httpd = _Server(("0.0.0.0", self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
         return self
@@ -421,6 +561,21 @@ class ReconViz:
         numbers CHECKPOINT_REPORT.md/.json are built from."""
         self._broadcast(json.dumps({"t": "report", "d": report}))
 
+    def wait_final(self, timeout=20.0):
+        """For a caller that exits right after push_report() (--no-viz-hold):
+        keeps the server up until a connected browser has fetched the
+        finished mesh, so "Watch live" ends on the result instead of a dead
+        page. Returns at once when nobody is watching."""
+        with self._lock:
+            watching = bool(self._clients)
+        if watching:
+            self._final_served.wait(timeout)
+
     def stop(self):
+        # In the persistent worker this process outlives the run, so the
+        # port must really be released and the open event streams closed -
+        # otherwise the next job cannot bind it.
+        self._broadcast(None)
         if self._httpd is not None:
             self._httpd.shutdown()
+            self._httpd.server_close()

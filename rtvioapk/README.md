@@ -118,6 +118,36 @@ end of a long build.
 
 ---
 
+## Studio mode (Tailscale)
+
+When the phone has **Tailscale on** and the Studio answers at **Settings → Server IP**
+(a `100.x.y.z` address or a `*.ts.net` name, port from **Studio web port**, default
+8080), the main screen gains a **Studio card**. Without Tailscale — or when the PC is
+on a different tailnet, so the Studio does not answer — the card never appears and the
+app behaves exactly as before.
+
+- **Open Studio** shows the Studio website inside the app (a WebView overlay on the
+  camera screen — not a second activity, because CameraX is tied to this activity and
+  would stop). Sessions, the 3D viewer, live watch, uploads and downloads all work there.
+- **Live reconstruct** and **Enhance image quality** checkboxes apply to the next take.
+  **● REC** then starts the take *through the Studio*, so live reconstruction runs on the
+  PC while the phone streams; **■ STOP** ends it.
+- The card follows the take: recording → reconstructing (the job's own progress line and
+  bar) → done, when the result viewer opens by itself. **View result** reopens it.
+- **Auto-connect in Studio mode** (Settings, on by default) connects the phone to the
+  Studio without pressing CONNECT.
+- Set **Studio password** in Settings if the Studio has one.
+
+**Mobile data works.** With Tailscale on, the phone reaches the PC's tailnet address over
+WiFi or cellular alike, so the "Connect to WiFi first" check is skipped for a tailnet Server
+IP (it still applies to a plain LAN address). Off WiFi, the card shows roughly how much data a
+minute of recording uses (from the resolution, frame rate and JPEG quality in Settings) —
+720p at 30 fps is tens of megabytes a minute, so lower those if your plan is limited.
+
+The app cannot see which Tailscale account it is signed in to; "same account" is inferred
+from a tailnet address on the phone plus the Studio answering there. Reconstruction still
+runs on the PC's GPU — the phone only captures and shows the result.
+
 ## Using the app
 
 Set **Settings → Server IP / Server port** to the desktop running the receiver

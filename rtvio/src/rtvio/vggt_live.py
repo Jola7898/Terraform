@@ -99,8 +99,9 @@ class VGGTLiveReconstructor:
                 voxel_factor=1.0, min_views=2, poisson_depth=10, make_mesh=True,
                 gps_mode=None, ref_lat=None, ref_lon=None, ref_alt=None, extras=False,
                 cell_size_m=1.0, progress_path=None, viz=None,
-                camera=None, undistort_balance=0.0, masker=None):
+                camera=None, undistort_balance=0.0, masker=None, enhance=False):
         self.out_dir = out_dir
+        self.enhance = enhance
         self.frames_dir = os.path.join(out_dir, "frames")
         os.makedirs(self.frames_dir, exist_ok=True)
         self.window_frames = window_frames
@@ -170,7 +171,9 @@ class VGGTLiveReconstructor:
             # FrameLoader keeps the exact list object we keep appending to,
             # so later frames need no separate hand-off into it.
             self.loader = FrameLoader(self.frame_paths, masker=self.masker, camera=self.camera,
-                                      undistort_balance=self.undistort_balance)
+                                      undistort_balance=self.undistort_balance, enhance=self.enhance)
+            if self.enhance:
+                log("image enhancement on: one shared tone curve + light denoise + mild sharpen")
             tokens = (self.loader.H // 14) * (self.loader.W // 14)
             log("input: live stream, %dx%d%s -> VGGT %dx%d (%d tokens/frame)"
                 % (self.loader.src_size[0], self.loader.src_size[1],
@@ -371,6 +374,9 @@ def build_argparser():
     ap.add_argument("--intrinsics", default=None, metavar="JSON",
                     help="lens calibration (camera_model profile, e.g. data/drone_camera.json) to "
                          "undistort frames with, if the source itself carries none of its own")
+    ap.add_argument("--enhance", action="store_true",
+                    help="apply one shared contrast curve, a light denoise and a mild sharpen to every "
+                         "frame, identically, before VGGT")
     ap.add_argument("--no-undistort", action="store_true",
                     help="feed frames to VGGT as captured even if a lens calibration is available")
     ap.add_argument("--undistort-balance", type=float, default=0.0,
@@ -421,6 +427,7 @@ def _build_reconstructor(args, viz):
         gps_mode=args.gps_mode, ref_lat=args.ref_lat, ref_lon=args.ref_lon, ref_alt=args.ref_alt,
         extras=args.extras, cell_size_m=args.cell_size_m, progress_path=args.progress, viz=viz,
         camera=camera, undistort_balance=args.undistort_balance, masker=masker,
+        enhance=args.enhance,
     )
 
 
@@ -498,6 +505,8 @@ def _hold_or_stop_viz(viz, args, url):
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
+    else:
+        viz.wait_final()
     viz.stop()
 
 

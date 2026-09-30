@@ -1,11 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="brand">#1B6FE3</color>
-    <color name="brand_dark">#0B4EA8</color>
-    <color name="stop_red">#C62828</color>
+    <!-- Same palette as the RTVIO Studio website's dark theme (Home page). -->
+    <color name="bg">#0A0C10</color>
+    <color name="panel">#12161C</color>
+    <color name="panel2">#191E26</color>
+    <color name="line">#252B34</color>
+    <color name="text">#F1F4F8</color>
+    <color name="text2">#B3BFCC</color>
+    <color name="muted">#8794A4</color>
+    <color name="brand">#7AA7E8</color>
+    <color name="brand_dark">#2F4A72</color>
+    <color name="accent2">#5FC3B5</color>
+    <color name="accent_soft">#1B2B44</color>
+    <color name="accent_line">#2F4A72</color>
+    <color name="stop_red">#E5484D</color>
     <color name="overlay_scrim">#99000000</color>
-    <color name="status_ok">#2E7D32</color>
-    <color name="status_warn">#EF6C00</color>
-    <color name="status_error">#C62828</color>
+    <color name="status_ok">#4FC596</color>
+    <color name="status_warn">#E3B25C</color>
+    <color name="status_error">#F06A6A</color>
     <color name="overlay_text">#FFFFFFFF</color>
 </resources>

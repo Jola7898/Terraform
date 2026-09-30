@@ -14,6 +14,7 @@ goes (stage, window i/n, ETA), plus its full stdout in job.log.
 """
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -121,6 +122,15 @@ def build_command(kind, source, out_dir, params, viz_port=None):
         v = params.get(key)
         if v not in (None, "", "auto"):
             cmd += [flag, str(v)]
+    if params.get("enhance"):
+        cmd.append("--enhance")                  # every kind: recording, video, live
+    if kind == "video" and params.get("adaptive_frames", False):
+        cmd.append("--keyframes")
+        if params.get("keyframe_shift"):
+            cmd += ["--keyframe-shift", str(params["keyframe_shift"])]
+    if kind == "video" and params.get("drone_fisheye"):
+        fov = [params.get("fisheye_hfov") or 124, params.get("fisheye_vfov") or 60]
+        cmd += ["--fisheye-fov"] + [str(float(v)) for v in fov]
     if params.get("window_frames") == "auto":
         cmd += ["--window-frames", "auto"]
     if not params.get("masking", False):
@@ -133,6 +143,84 @@ def build_command(kind, source, out_dir, params, viz_port=None):
         # can start - see vggt_reconstruct.py's matching --no-viz-hold help.
         cmd += ["--live-viz", "--viz-port", str(viz_port), "--no-viz-hold"]
     return cmd
+
+
+class WarmWorker:
+    """One long-lived `python -m rtvio.vggt_worker` process with VGGT already
+    on the GPU. Jobs run inside it one at a time, so a reconstruction starts
+    with the model loaded instead of spending the first stretch of every job
+    reading a 5 GB checkpoint. It is (re)started as soon as it is missing,
+    so the model is loading again right after a Cancel or a crash rather than
+    when the next video arrives.
+
+    Cost: the model's VRAM stays reserved while the Studio runs. Start the
+    Studio with --no-warm-model to get the old one-process-per-job behaviour."""
+
+    def __init__(self, cwd=None, env=None):
+        self.cwd, self.env = cwd, env
+        self.proc = None
+        self.ready = threading.Event()
+        self._results = queue.Queue()
+        self._lock = threading.Lock()
+
+    def ensure(self):
+        """The running worker, starting one if there is none."""
+        with self._lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return self.proc
+            self.ready.clear()
+            results = self._results = queue.Queue()
+            logdir = os.path.join(self.cwd or ".", "data")
+            os.makedirs(logdir, exist_ok=True)
+            errlog = open(os.path.join(logdir, "vggt_worker.log"), "a", encoding="utf-8", errors="replace")
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", "-m", "rtvio.vggt_worker"], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=errlog, cwd=self.cwd, env=self.env, text=True,
+                    encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            finally:
+                errlog.close()
+            self.proc = proc
+            threading.Thread(target=self._read, args=(proc, results), daemon=True, name="warm-reader").start()
+            print("[recon] warm VGGT worker started (pid %d) - loading the model" % proc.pid, flush=True)
+            return proc
+
+    def _read(self, proc, results):
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("ready"):
+                if proc is self.proc:
+                    self.ready.set()
+                    print("[recon] warm VGGT worker ready", flush=True)
+            else:
+                results.put(msg)
+        results.put({"dead": True})
+
+    def run(self, job_id, module, argv, log_path, on_proc=None):
+        """Runs one job in the worker; its stdout/stderr go to log_path.
+        Returns the exit code, or None if the worker could not run it or died
+        (killed by Cancel, or crashed - out of memory takes the whole process)."""
+        proc = self.ensure()
+        results = self._results
+        if on_proc:
+            on_proc(proc)
+        while not self.ready.wait(0.5):
+            if proc.poll() is not None:
+                return None
+        try:
+            proc.stdin.write(json.dumps({"id": job_id, "module": module, "argv": argv, "log": log_path}) + "\n")
+            proc.stdin.flush()
+        except OSError:
+            return None
+        while True:
+            msg = results.get()
+            if msg.get("dead"):
+                return None
+            if msg.get("done") == job_id:
+                return msg.get("rc")
 
 
 class ReconJob:
@@ -195,8 +283,10 @@ class ReconJob:
 
 
 class ReconQueue:
-    def __init__(self, gpu_monitor=None, cwd=None, video_root=None, viz_port=None):
+    def __init__(self, gpu_monitor=None, cwd=None, video_root=None, viz_port=None, warm=True):
         self.gpu = gpu_monitor
+        self.warm = warm and os.environ.get("RTVIO_NO_WARM") != "1"
+        self.worker = None
         self.cwd = cwd
         self.video_root = video_root
         self.viz_port = viz_port      # same port every job - they run one at a time (see module docstring)
@@ -205,6 +295,9 @@ class ReconQueue:
         self._wake = threading.Event()
 
     def start(self):
+        if self.warm:
+            self.worker = WarmWorker(self.cwd, dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8"))
+            self.worker.ensure()                    # start loading VGGT now, before the first job
         threading.Thread(target=self._worker, daemon=True, name="recon-worker").start()
         return self
 
@@ -305,14 +398,28 @@ class ReconQueue:
         with open(os.path.join(job.out_dir, "job.log"), "w", encoding="utf-8") as log:
             log.write("$ %s\n\n" % " ".join(cmd))
             log.flush()
-            try:
-                job.proc = subprocess.Popen(
-                    cmd, stdout=log, stderr=subprocess.STDOUT, cwd=self.cwd, env=env,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                job.returncode = job.proc.wait()
-            except OSError as e:
-                job.error = str(e)
+        if self.worker is not None and "-m" in cmd:
+            m = cmd.index("-m")
+            def set_proc(p):
+                job.proc = p
+            rc = self.worker.run(job.id, cmd[m + 1], cmd[m + 2:], os.path.join(job.out_dir, "job.log"), set_proc)
+            if rc is None:
                 job.returncode = -1
+                if job.state != "cancelling":
+                    job.error = "the VGGT worker process stopped (out of memory?) - see data/vggt_worker.log"
+                threading.Thread(target=self.worker.ensure, daemon=True).start()   # warm a fresh one
+            else:
+                job.returncode = rc
+        else:
+            with open(os.path.join(job.out_dir, "job.log"), "a", encoding="utf-8") as log:
+                try:
+                    job.proc = subprocess.Popen(
+                        cmd, stdout=log, stderr=subprocess.STDOUT, cwd=self.cwd, env=env,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    job.returncode = job.proc.wait()
+                except OSError as e:
+                    job.error = str(e)
+                    job.returncode = -1
         job.finished = time.time()
         if self.gpu is not None:
             samples = self.gpu.since(job.started)

@@ -26,7 +26,9 @@ port. The phone's TCP stream and the drone's RTSP + MAVLink are not HTTP;
 from outside the LAN those go over Tailscale.
 """
 import argparse
+import email.utils
 import fnmatch
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -67,7 +69,8 @@ DEFAULT_SETTINGS = {
     # alignment, every frame used.
     "recon": {"window_frames": "auto", "overlap": 8, "frame_stride": 1,
               "conf_percentile": 50, "poisson_depth": 10, "voxel_factor": 1.0,
-              "min_views": 2, "gps_mode": "off", "masking": False, "extras": False},
+              "min_views": 2, "gps_mode": "off", "masking": False, "extras": False,
+              "enhance": False},
     "auto_reconstruct": True,
     # Drone (drone_link.py). ip is the drone / companion computer - the
     # address iDronam's "Add Device" uses - and {ip} in video_url is replaced
@@ -80,11 +83,45 @@ DEFAULT_SETTINGS = {
               "record_long_side": 1280, "jpeg_quality": 90, "video_delay_ms": 0,
               # Lens calibration (camera_calib.py): checkerboard inner corners,
               # and whether the live view shows the undistorted frame.
-              "calib_cols": 9, "calib_rows": 6, "preview_undistort": False},
+              "calib_cols": 9, "calib_rows": 6, "preview_undistort": False,
+              "enhance": False},
 }
 
 SESSION_ID_RE = re.compile(r"^[\w.-]+$")
 VIDEO_EXTS = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp")
+IMAGE_EXTS = (".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".bmp", ".webp", ".tif", ".tiff", ".jp2", ".ppm", ".pgm")
+MAX_ZIP_BYTES = 40 * 1024 ** 3      # uncompressed - a zip bomb guard, not a real limit
+
+
+def unpack_upload_zip(zip_path, dest_dir, label="frames"):
+    """A .zip sent to the video upload -> ("video", path) if it holds a video,
+    ("images", folder) if it holds image frames, ("session", None) if it is a
+    Studio session export (the caller imports it). Members are written under
+    names we choose, so nothing in the archive can pick its own path."""
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir() and "__MACOSX" not in i.filename
+                 and not os.path.basename(i.filename).startswith("._")]
+        if sum(i.file_size for i in infos) > MAX_ZIP_BYTES:
+            raise ValueError("zip is too large when unpacked")
+        if any(os.path.basename(i.filename) == "session_meta.json" for i in infos):
+            return "session", None
+        videos = [i for i in infos if i.filename.lower().endswith(VIDEO_EXTS)]
+        if videos:
+            v = max(videos, key=lambda i: i.file_size)
+            out = os.path.join(dest_dir, re.sub(r"[^\w.-]", "_", os.path.basename(v.filename)) or "video.mp4")
+            with zf.open(v) as src, open(out, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            return "video", out
+        key = lambda i: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", i.filename.lower())]
+        images = sorted((i for i in infos if i.filename.lower().endswith(IMAGE_EXTS)), key=key)
+        if len(images) < 2:
+            raise ValueError("the zip needs a video file or at least 2 image frames")
+        folder = os.path.join(dest_dir, re.sub(r"[^\w.-]", "_", label) or "frames")
+        os.makedirs(folder)
+        for n, i in enumerate(images):
+            with zf.open(i) as src, open(os.path.join(folder, "%06d%s" % (n, os.path.splitext(i.filename)[1].lower())), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        return "images", folder
 UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_CHUNK_BYTES = 96 * 1024 * 1024      # under Cloudflare's 100 MB request cap
 AUTH_COOKIE = "rtvio_auth"
@@ -98,6 +135,11 @@ button{background:#2f6fed;border-color:#2f6fed;color:#fff;cursor:pointer}.err{co
 <input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
 <button type="submit">Sign in</button><div class="err">__ERROR__</div></form></body></html>"""
 PRIORITY_OUTPUTS = ("cloud_raw.ply", "mesh_poisson.ply")
+def _compressible(ctype):
+    """Text-like responses worth gzipping (not the binary meshes, which barely shrink)."""
+    return ctype.startswith("text/") or "json" in ctype or "javascript" in ctype or ctype.startswith("image/svg")
+
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8", ".json": "application/json",
@@ -139,7 +181,7 @@ def _merge(base, override):
 
 
 class Studio:
-    def __init__(self, data_root, phone_host, phone_port, viz_port=8767):
+    def __init__(self, data_root, phone_host, phone_port, viz_port=8767, warm_model=True):
         self.data_root = data_root
         self.sessions_root = os.path.join(data_root, "sessions")
         self.video_root = os.path.join(data_root, "video_jobs")
@@ -149,7 +191,8 @@ class Studio:
         self.settings_path = os.path.join(data_root, "studio_settings.json")
         self.settings = _merge(DEFAULT_SETTINGS, self._load_settings())
         self.gpu = GpuMonitor().start()
-        self.queue = ReconQueue(self.gpu, cwd=RTVIO_ROOT, video_root=self.video_root, viz_port=viz_port).start()
+        self.queue = ReconQueue(self.gpu, cwd=RTVIO_ROOT, video_root=self.video_root, viz_port=viz_port,
+                               warm=warm_model).start()
         self.phone = PhoneLink(self.sessions_root, phone_host, phone_port,
                                on_session_finalized=self._on_finalized)
         self.phone.start()
@@ -210,6 +253,7 @@ class Studio:
         if meta.get("origin") == "drone":
             outdoor = meta.get("drone_mode") == "outdoor" and (meta.get("gps_fixes") or 0) > 0
             params["gps_mode"] = "global" if outdoor else "off"
+            params["enhance"] = bool(self.settings["drone"].get("enhance"))
             # A take recorded before the lens was calibrated carries no
             # camera_intrinsics.json of its own: straighten it with today's
             # calibration of the same camera (vggt_reconstruct checks the
@@ -227,7 +271,8 @@ class Studio:
         camera_intrinsics.json/GPS track are still what vggt_live --tail
         actually reconstructs with (see run_tail); this only decides what to
         ask for up front."""
-        overrides = {"gps_mode": "global" if self.settings["drone"]["mode"] == "outdoor" else "off"}
+        overrides = {"gps_mode": "global" if self.settings["drone"]["mode"] == "outdoor" else "off",
+                     "enhance": bool(self.settings["drone"].get("enhance"))}
         if self.drone.camera is not None:
             overrides["intrinsics"] = self.drone.camera_path
         return self.recon_params(session_dir, overrides)
@@ -579,6 +624,11 @@ def make_handler(studio, password=None, cors_origins=()):
                 body = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            # JSON is repetitive: gzip it for the phone / tunnel case (the state poll is ~40 KB a second).
+            if len(body) > 1400 and _compressible(ctype) and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                body = gzip.compress(body, 4)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             for k, v in (extra or {}).items():
@@ -598,14 +648,45 @@ def make_handler(studio, password=None, cors_origins=()):
 
         def _file(self, path):
             try:
-                size = os.path.getsize(path)
+                st = os.stat(path)
             except OSError:
                 return self._send(404, {"error": "not found"})
+            size = st.st_size
+            ctype = CONTENT_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+            # Revalidate instead of never caching: the page, three.js and a finished mesh are
+            # re-downloaded only if they changed (a 304 costs nothing on a phone's data), and
+            # the vendored libraries may simply be kept for a day.
+            last_mod = email.utils.formatdate(st.st_mtime, usegmt=True)
+            try:
+                since = email.utils.parsedate_to_datetime(self.headers.get("If-Modified-Since") or "")
+                unchanged = since is not None and int(st.st_mtime) <= int(since.timestamp())
+            except (TypeError, ValueError):
+                unchanged = False
+            cache = "public, max-age=86400" if os.sep + "vendor" + os.sep in path else "no-cache"
+            if unchanged:
+                self.send_response(304)
+                self.send_header("Last-Modified", last_mod)
+                self.send_header("Cache-Control", cache)
+                self.end_headers()
+                return
+            if _compressible(ctype) and size < (8 << 20) and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                with open(path, "rb") as f:
+                    body = gzip.compress(f.read(), 5)
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Last-Modified", last_mod)
+                self.send_header("Cache-Control", cache)
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(200)
-            self.send_header("Content-Type", CONTENT_TYPES.get(
-                os.path.splitext(path)[1].lower(), "application/octet-stream"))
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(size))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Last-Modified", last_mod)
+            self.send_header("Cache-Control", cache)
             self.end_headers()
             with open(path, "rb") as f:
                 while True:
@@ -738,7 +819,7 @@ def make_handler(studio, password=None, cors_origins=()):
                                   extra={"Connection": "close"})
             return self._send(200, {"ok": True, "size": size + n})
 
-        def _upload_video(self, uid, name):
+        def _upload_video(self, uid, name, q=None):
             """Moves a finished chunked upload to
             <data-root>/uploads/<timestamp>/<name> and queues it exactly
             like /api/reconstruct-video. This is how a clip reaches the GPU
@@ -748,8 +829,9 @@ def make_handler(studio, password=None, cors_origins=()):
             if p is None or not os.path.exists(p):
                 return self._send(404, {"ok": False, "error": "no such upload"})
             safe = re.sub(r"[^\w.-]", "_", os.path.basename(name or "").strip()) or "video.mp4"
-            if not os.path.getsize(p) or os.path.splitext(safe)[1].lower() not in VIDEO_EXTS:
-                return self._send(400, {"ok": False, "error": "expected a non-empty %s file"
+            ext = os.path.splitext(safe)[1].lower()
+            if not os.path.getsize(p) or ext not in VIDEO_EXTS + (".zip",):
+                return self._send(400, {"ok": False, "error": "expected a video (%s) or a .zip of image frames"
                                         % "/".join(VIDEO_EXTS)})
             base = os.path.join(studio.upload_root, time.strftime("%Y%m%d-%H%M%S"))
             d, k = base, 2
@@ -757,8 +839,47 @@ def make_handler(studio, password=None, cors_origins=()):
                 d, k = "%s-%d" % (base, k), k + 1
             os.makedirs(d)
             dest = os.path.join(d, safe)
-            os.replace(p, dest)
-            job = studio.queue.submit_video(dest, dict(studio.settings["recon"]))
+            if ext == ".zip":
+                try:
+                    kind, res = unpack_upload_zip(p, d, os.path.splitext(safe)[0])
+                except (zipfile.BadZipFile, ValueError, OSError) as e:
+                    shutil.rmtree(d, ignore_errors=True)
+                    return self._send(400, {"ok": False, "error": "could not use the zip: %s" % e})
+                finally:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                if kind == "session":
+                    shutil.rmtree(d, ignore_errors=True)
+                    # a Studio session export is not a fresh clip
+                    return self._send(400, {"ok": False, "error": "this zip is a Studio session export - "
+                                            "use Sessions -> Import session (.zip) for it"})
+                dest = res
+            else:
+                os.replace(p, dest)
+            # A video upload is its own thing: its options come from the upload
+            # checkboxes only, never from the phone's / drone's saved settings.
+            params = dict(studio.settings["recon"], enhance=False)
+            q = q or {}
+            if q.get("enhance", ["0"])[0] == "1":
+                params["enhance"] = True
+            if q.get("fast", ["0"])[0] == "1":
+                # Fast mode: only frames where the drone has moved (vggt_reconstruct.
+                # sample_video_keyframes). Nothing else is touched - measured on a
+                # 1033-frame clip: 231 s -> 79 s, and a cleaner cloud, because far
+                # fewer windows are chained together.
+                params["adaptive_frames"] = True
+            if q.get("fisheye", ["0"])[0] == "1":
+                try:
+                    hf = float(q.get("hfov", ["124"])[0])
+                    vf = float(q.get("vfov", ["60"])[0])
+                except ValueError:
+                    return self._send(400, {"ok": False, "error": "field of view must be a number"})
+                if not (0 < hf < 360 and 0 < vf < 360):
+                    return self._send(400, {"ok": False, "error": "field of view must be between 0 and 360 degrees"})
+                params.update(drone_fisheye=True, fisheye_hfov=hf, fisheye_vfov=vf)
+            job = studio.queue.submit_video(dest, params)
             return self._send(200, {"ok": True, "job": job.id})
 
         def _import_uploaded_session(self, uid, preferred_id):
@@ -1007,7 +1128,7 @@ def make_handler(studio, password=None, cors_origins=()):
                     offset = -1
                 return self._upload_chunk(m.group(1), offset)
             if path == "/api/upload-video":
-                return self._upload_video(q.get("upload", [None])[0], q.get("name", [None])[0])
+                return self._upload_video(q.get("upload", [None])[0], q.get("name", [None])[0], q)
             if path == "/api/sessions/import":
                 preferred = q.get("id", [None])[0]
                 if q.get("upload"):
@@ -1074,9 +1195,10 @@ def make_handler(studio, password=None, cors_origins=()):
                 # starts with a double quote.
                 raw = (body.get("path") or "").strip().strip('"').strip("'").strip()
                 p = os.path.abspath(raw) if raw else ""
-                if not p or not os.path.isfile(p):
-                    return self._send(404, {"ok": False, "error": "no such file: %s" % (p or raw)})
-                job = studio.queue.submit_video(p, _merge(studio.settings["recon"], body.get("recon") or {}))
+                if not p or not (os.path.isfile(p) or os.path.isdir(p)):
+                    return self._send(404, {"ok": False, "error": "no such file or folder: %s" % (p or raw)})
+                job = studio.queue.submit_video(p, _merge(dict(studio.settings["recon"], enhance=False),
+                                                          body.get("recon") or {}))
                 return self._send(200, {"ok": True, "job": job.id})
             m = re.match(r"^/api/jobs/(\d+)/cancel$", path)
             if m:
@@ -1114,6 +1236,9 @@ def main():
     ap.add_argument("--data-root", default=DEFAULT_DATA_ROOT,
                     help="sessions are written to <data-root>/sessions/<id>/, video-file jobs to "
                          "<data-root>/video_jobs/<name>-<n>/")
+    ap.add_argument("--no-warm-model", action="store_true",
+                    help="do not keep VGGT loaded between reconstructions (one process per job, model "
+                         "reloaded each time, its VRAM freed in between)")
     ap.add_argument("--recon-viz-port", type=int, default=8767,
                     help="port for each reconstruction's live viewer (--live-viz) - always the same "
                          "port since jobs.py runs one reconstruction at a time")
@@ -1134,7 +1259,8 @@ def main():
         ap.error("--cors-origin means this API is used from the internet: set a password "
                  "(RTVIO_STUDIO_PASSWORD or --password)")
 
-    studio = Studio(args.data_root, args.phone_host, args.phone_port, viz_port=args.recon_viz_port)
+    studio = Studio(args.data_root, args.phone_host, args.phone_port, viz_port=args.recon_viz_port,
+                    warm_model=not args.no_warm_model)
     httpd = ThreadingHTTPServer((args.web_host, args.port),
                                 make_handler(studio, args.password, tuple(args.cors_origin)))
     httpd.daemon_threads = True
