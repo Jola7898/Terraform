@@ -8,6 +8,14 @@ Writes frames/NNNNNN.jpg (the bag's JPEGs, not re-encoded), frame_timestamps.jso
 (standalone u-blox ZED-F9P fixes: what the pipeline gets), camera_intrinsics.json, and - never read
 by the pipeline - ground_truth_rtk.csv (DJI RTK) plus session_meta.json for tools/eval_trajectory.py.
 Needs `pip install rosbags opencv-python pyyaml`.
+
+--video also writes flight.mp4 (H.264, needs ffmpeg) + gps.csv: the same flight as a real drone delivers it,
+video plus telemetry. Video time 0 is the first frame, so eval_trajectory.py scores it against this directory:
+
+    python tools/marslvig_to_session.py --bag ... --calib ... --out /tmp/hk --stride 1 --video
+    python -m rtvio.vggt_reconstruct --video /tmp/hk/flight.mp4 --gps /tmp/hk/gps.csv \
+        --intrinsics /tmp/hk/camera_intrinsics.json --gps-mode guided --sample-fps 5 --out /tmp/hk_video_run
+    python tools/eval_trajectory.py --session /tmp/hk --run /tmp/hk_video_run
 """
 import argparse
 import csv
@@ -89,6 +97,54 @@ def intrinsics_profile(calib, width, height, source):
             "k1": k1, "k2": k2, "p1": p1, "p2": p2, "k3": k3, "source": source}
 
 
+def video_fps(rel_times):
+    """Constant frame rate matching the kept frames' median spacing (camera 10 Hz / stride)."""
+    dt = np.diff(np.asarray(rel_times, float))
+    return float(np.round(1.0 / np.median(dt), 3))
+
+
+def concat_list(names, rel_times):
+    """ffmpeg concat-demuxer script that shows each JPEG until the next one's real capture time, so dropped
+    camera frames become held frames and video time stays equal to capture time."""
+    lines = ["ffconcat version 1.0"]
+    for i, name in enumerate(names):
+        lines.append("file '%s'" % name)
+        if i + 1 < len(names):
+            lines.append("duration %.6f" % (rel_times[i + 1] - rel_times[i]))
+    lines.append("file '%s'" % names[-1])       # concat drops the last entry's duration; repeat it
+    return "\n".join(lines) + "\n"
+
+
+def encode_video(frames_dir, names, rel_times, out_path, long_edge=0, crf=18):
+    """frames -> constant-frame-rate H.264 mp4 in which video frame k was captured at rel_times[0] + k / fps."""
+    import subprocess
+    fps = video_fps(rel_times)
+    script = os.path.join(frames_dir, "concat.txt")
+    with open(script, "w") as f:
+        f.write(concat_list(names, rel_times))
+    vf = "fps=%g" % fps
+    if long_edge:
+        vf += ",scale='if(gte(iw,ih),%d,-2)':'if(gte(iw,ih),-2,%d)'" % (long_edge, long_edge)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", script, "-vf", vf,
+           "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p", out_path]
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        os.remove(script)
+    return fps
+
+
+def write_gps_csv(path, gnss, t0, lo, hi):
+    """The --gps telemetry CSV vggt_reconstruct --video reads: seconds from the video's first frame."""
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp_s", "lat_deg", "lon_deg", "alt_m", "accuracy_m"])
+        for g in gnss:
+            if lo <= g["t"] <= hi:
+                w.writerow(["%.6f" % (g["t"] - t0), "%.10f" % g["lat"], "%.10f" % g["lon"], "%.4f" % g["alt"],
+                            "%.3f" % g["h_acc"]])
+
+
 def _stamp(msg):
     return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
@@ -101,6 +157,10 @@ def main():
     ap.add_argument("--stride", type=int, default=1, help="keep every Nth in-flight frame (camera is 10 Hz)")
     ap.add_argument("--no-trim", action="store_true", help="keep hover/takeoff/landing frames")
     ap.add_argument("--min-speed", type=float, default=1.0, help="m/s that counts as flying, for trimming")
+    ap.add_argument("--video", action="store_true",
+                    help="also write flight.mp4 + gps.csv: the drone-style input for vggt_reconstruct --video")
+    ap.add_argument("--video-long-edge", type=int, default=0, help="downscale the video's long edge (0 = keep)")
+    ap.add_argument("--video-crf", type=int, default=18, help="H.264 quality (lower = better, larger)")
     args = ap.parse_args()
 
     import cv2
@@ -199,6 +259,14 @@ def main():
         "gps_utc_leap_s": GPS_UTC_LEAP_S, "clock_vs_bag_receive_time": clock,
         "datum": datum_offsets([x for x in rtk if lo <= x["t"] <= hi], in_seg),
     }
+    if args.video:
+        names = ["%06d.jpg" % i for i in range(kept)]
+        rel = [t - t0 for t in frame_times]
+        fps = encode_video(os.path.join(args.out, "frames"), names, rel, os.path.join(args.out, "flight.mp4"),
+                           args.video_long_edge, args.video_crf)
+        write_gps_csv(os.path.join(args.out, "gps.csv"), gnss, t0, lo, hi)
+        meta["video"] = {"file": "flight.mp4", "fps": fps, "long_edge": args.video_long_edge or max(size),
+                         "crf": args.video_crf, "gps_csv": "gps.csv", "t0": "first frame = video 0 s = t0_unix_utc"}
     with open(os.path.join(args.out, "session_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(json.dumps(meta, indent=2))

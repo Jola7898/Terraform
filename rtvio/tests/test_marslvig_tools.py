@@ -146,7 +146,45 @@ def test_interp_gap_handling():
           ok.tolist() == [True, False, True, False] and abs(vals[0, 2] - 1.0) < 1e-9, str(ok.tolist()))
 
 
+def test_video_keeps_capture_time():
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        check("video: skipped (no ffmpeg on PATH)", True)
+        return
+    # 10 Hz camera with frame 5 dropped: the video must hold frame 4 there, so video frame k is still t = k / 10.
+    times = [0.0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1]
+    greys = [20 * i for i in range(len(times))]
+    with tempfile.TemporaryDirectory() as d:
+        names = []
+        for i, g in enumerate(greys):
+            names.append("%06d.jpg" % i)
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "color=c=0x%02x%02x%02x:s=64x48" % (g, g, g), "-frames:v", "1", "-q:v", "2",
+                            os.path.join(d, names[-1])], check=True)
+        out = os.path.join(d, "flight.mp4")
+        fps = conv.encode_video(d, names, times, out)
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", out, "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                             capture_output=True, check=True).stdout
+        frames = np.frombuffer(raw, np.uint8).reshape(-1, 48, 64)
+        got = [int(np.argmin(np.abs(np.array(greys) - f.mean()))) for f in frames]
+        want = [int(np.searchsorted(times, k / fps + 1e-6, side="right") - 1) for k in range(len(frames))]
+        check("video: 10 fps, 12 frames for 1.1 s, dropped frame held", fps == 10.0 and len(frames) == 12
+              and got == want, "fps %s, frames %d, shown %s" % (fps, len(frames), got))
+        check("video: concat script removed", not os.path.exists(os.path.join(d, "concat.txt")))
+
+        gnss = [{"t": 100.0 + t, "lat": 22.4 + 1e-5 * t, "lon": 114.0, "alt": 90.0, "h_acc": 0.5}
+                for t in (-9.0, -0.5, 0.25, 3.0)]
+        csv_path = os.path.join(d, "gps.csv")
+        conv.write_gps_csv(csv_path, gnss, 100.0, 95.0, 105.0)
+        rows = list(csv.DictReader(open(csv_path)))
+        check("gps.csv: video-relative seconds, window-trimmed, reader's columns",
+              [float(r["timestamp_s"]) for r in rows] == [-0.5, 0.25, 3.0]
+              and set(rows[0]) >= {"timestamp_s", "lat_deg", "lon_deg", "alt_m"})
+
+
 if __name__ == "__main__":
+    test_video_keeps_capture_time()
     test_gps_time_matches_the_bag()
     test_flight_segment()
     test_nearest_pairs()
