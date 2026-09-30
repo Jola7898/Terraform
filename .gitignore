@@ -34,3 +34,5 @@ deploy/vercel/dist/
 # Runtime reconstruction data
 rtvio/data/uploads/
 rtvio/data/*.log
+
+rtvio/data/uploads/
